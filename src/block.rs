@@ -1,66 +1,38 @@
-use sha2::{self, Digest};
-use std::time::SystemTime;
+use sha2::{Digest, Sha256};
+use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 
-pub struct Block {
-    timestamp: i64,
-    data: Vec<u8>,
-    prev_hash: Hash,
-    pub hash: Hash,
+#[derive(Debug, Error)]
+pub enum BlockError {
+    #[error("Failed to get system time: {0}")]
+    TimeError(#[from] std::time::SystemTimeError),
+    #[error("Failed to convert data to string: {0}")]
+    DataEncodingError(#[from] std::string::FromUtf8Error),
 }
 
-impl Block {
-    pub fn new(data: Vec<u8>, prev_hash: Hash) -> Block {
-        let mut block = Block {
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
-            data,
-            prev_hash,
-            hash: Hash::default(),
-        };
-        block.set_hash();
-        block
-    }
-
-    fn set_hash(&mut self) {
-        let data = [
-            self.timestamp.to_be_bytes().to_vec(),
-            self.data.clone(),
-            self.prev_hash.0.clone(),
-        ]
-        .concat();
-        self.hash = Hash::new(data);
-    }
-
-    pub fn new_genesis_block() -> Block {
-        Block::new(b"Genesis Block".to_vec(), Hash::default())
-    }
-}
-
-impl std::fmt::Display for Block {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        writeln!(f, "timestamp: {},", self.timestamp)?;
-        writeln!(f, "data: {},", String::from_utf8_lossy(&self.data))?;
-        writeln!(f, "prev_hash: {},", self.prev_hash)?;
-        writeln!(f, "hash: {},", self.hash)?;
-        Ok(())
-    }
-}
-
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Hash(Vec<u8>);
 
 impl Hash {
-    fn new(data: Vec<u8>) -> Hash {
-        let mut hasher = sha2::Sha256::new();
+    pub fn new(data: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
         hasher.update(data);
-        Hash(hasher.finalize().to_vec())
+        Self(hasher.finalize().to_vec())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Default for Hash {
+    fn default() -> Self {
+        Self(vec![0; 32])
     }
 }
 
 impl std::fmt::Display for Hash {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for byte in &self.0 {
             write!(f, "{:02x}", byte)?;
         }
@@ -68,10 +40,92 @@ impl std::fmt::Display for Hash {
     }
 }
 
-impl std::ops::Deref for Hash {
-    type Target = Vec<u8>;
+#[derive(Debug)]
+pub struct Block {
+    timestamp: i64,
+    data: Vec<u8>,
+    prev_hash: Hash,
+    hash: Hash,
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl Block {
+    pub fn new(data: Vec<u8>, prev_hash: Hash) -> Result<Self, BlockError> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+
+        let mut block = Self {
+            timestamp,
+            data,
+            prev_hash,
+            hash: Hash::default(),
+        };
+
+        block.generate_hash();
+        Ok(block)
+    }
+
+    pub fn genesis() -> Result<Self, BlockError> {
+        Self::new(b"Genesis Block".to_vec(), Hash::default())
+    }
+
+    pub fn hash(&self) -> &Hash {
+        &self.hash
+    }
+
+    pub fn prev_hash(&self) -> &Hash {
+        &self.prev_hash
+    }
+
+    #[allow(dead_code)]
+    pub fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+
+    #[allow(dead_code)]
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    fn generate_hash(&mut self) {
+        let data = [
+            &self.timestamp.to_be_bytes(),
+            self.data.as_slice(),
+            self.prev_hash.as_bytes(),
+        ]
+        .concat();
+        self.hash = Hash::new(&data);
+    }
+}
+
+impl std::fmt::Display for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Timestamp: {}", self.timestamp)?;
+        writeln!(f, "Data: {}", String::from_utf8_lossy(&self.data))?;
+        writeln!(f, "Previous Hash: {}", self.prev_hash)?;
+        writeln!(f, "Hash: {}", self.hash)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_genesis_block() -> Result<(), BlockError> {
+        let genesis = Block::genesis()?;
+        assert_eq!(genesis.data(), b"Genesis Block");
+        assert_eq!(genesis.prev_hash().as_bytes(), Hash::default().as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_creation() -> Result<(), BlockError> {
+        let genesis = Block::genesis()?;
+        let data = b"Test Block".to_vec();
+        let block = Block::new(data.clone(), genesis.hash().clone())?;
+
+        assert_eq!(block.data(), data);
+        assert_eq!(block.prev_hash().as_bytes(), genesis.hash().as_bytes());
+        Ok(())
     }
 }
