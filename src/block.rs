@@ -1,6 +1,9 @@
-use sha2::{Digest, Sha256};
+use generic_array::{typenum, GenericArray};
+use num_bigint::BigUint;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+use crate::proof_of_work::ProofOfWork;
 
 #[derive(Debug, Error)]
 pub enum BlockError {
@@ -10,30 +13,21 @@ pub enum BlockError {
     DataEncodingError(#[from] std::string::FromUtf8Error),
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Hash(Vec<u8>);
+pub type HashArray = GenericArray<u8, typenum::U32>;
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Hash(pub HashArray);
 
 impl Hash {
-    pub fn new(data: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        Self(hasher.finalize().to_vec())
-    }
-
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
 
-impl Default for Hash {
-    fn default() -> Self {
-        Self(vec![0; 32])
-    }
-}
-
 impl std::fmt::Display for Hash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in &self.0 {
+        // 先遍历到的是低地址（即低位，小端序），所以要反转，这样输出的时候才是高位在前
+        for byte in self.0.iter().rev() {
             write!(f, "{:02x}", byte)?;
         }
         Ok(())
@@ -41,11 +35,13 @@ impl std::fmt::Display for Hash {
 }
 
 #[derive(Debug)]
+// 所有字段都认为是小端序
 pub struct Block {
     timestamp: i64,
     data: Vec<u8>,
     prev_hash: Hash,
     hash: Hash,
+    nonce: BigUint,
 }
 
 impl Block {
@@ -57,9 +53,12 @@ impl Block {
             data,
             prev_hash,
             hash: Hash::default(),
+            nonce: BigUint::default(),
         };
+        let (nonce, hash) = ProofOfWork::new(&block).run();
+        block.nonce = nonce;
+        block.hash = hash;
 
-        block.generate_hash();
         Ok(block)
     }
 
@@ -85,14 +84,9 @@ impl Block {
         &self.data
     }
 
-    fn generate_hash(&mut self) {
-        let data = [
-            &self.timestamp.to_be_bytes(),
-            self.data.as_slice(),
-            self.prev_hash.as_bytes(),
-        ]
-        .concat();
-        self.hash = Hash::new(&data);
+    #[allow(dead_code)]
+    pub fn nonce(&self) -> &BigUint {
+        &self.nonce
     }
 }
 

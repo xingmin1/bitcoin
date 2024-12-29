@@ -3,6 +3,7 @@ use clap::{self, Subcommand};
 use clap::{command, Parser};
 mod block;
 mod blockchain;
+mod proof_of_work;
 
 use blockchain::Blockchain;
 
@@ -103,6 +104,9 @@ mod tests {
 
         // Verify chain
         app.verify_chain()?;
+
+        // List blocks
+        app.list_blocks()?;
 
         Ok(())
     }

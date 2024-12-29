@@ -1,4 +1,4 @@
-use crate::block::{Block, BlockError};
+use crate::{block::{Block, BlockError}, proof_of_work::ProofOfWork};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -106,6 +106,7 @@ impl std::fmt::Display for Blockchain {
         for (i, block) in self.blocks.iter().enumerate() {
             writeln!(f, "Block #{}", i)?;
             writeln!(f, "{}", block)?;
+            writeln!(f, "Pow: {}", ProofOfWork::new(block).validate())?;
             writeln!(f, "----------------")?;
         }
         Ok(())
