@@ -53,7 +53,6 @@ impl BlockchainApp {
 
     fn list_blocks(&self) -> Result<()> {
         println!("{}", self.chain);
-        println!("Total blocks: {}", self.chain.height());
         Ok(())
     }
 

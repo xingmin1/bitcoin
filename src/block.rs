@@ -1,5 +1,6 @@
 use generic_array::{typenum, GenericArray};
 use num_bigint::BigUint;
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -11,16 +12,24 @@ pub enum BlockError {
     TimeError(#[from] std::time::SystemTimeError),
     #[error("Failed to convert data to string: {0}")]
     DataEncodingError(#[from] std::string::FromUtf8Error),
+    #[error("Invalid proof of work: {0}")]
+    InvalidProofOfWork(Block),
 }
 
 pub type HashArray = GenericArray<u8, typenum::U32>;
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct Hash(pub HashArray);
 
 impl Hash {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl From<HashArray> for Hash {
+    fn from(array: HashArray) -> Self {
+        Self(array)
     }
 }
 
@@ -34,7 +43,7 @@ impl std::fmt::Display for Hash {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 // 所有字段都认为是小端序
 pub struct Block {
     timestamp: i64,

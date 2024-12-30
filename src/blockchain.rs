@@ -1,5 +1,25 @@
-use crate::{block::{Block, BlockError}, proof_of_work::ProofOfWork};
+use crate::{
+    block::{Block, BlockError, Hash},
+    proof_of_work::ProofOfWork,
+};
+use rocksdb::DB;
 use thiserror::Error;
+
+const DB_PATH: &str = "blockchain.db";
+
+pub enum DbKey<'a> {
+    Tip,
+    Block(&'a Hash),
+}
+
+impl<'a> AsRef<[u8]> for DbKey<'a> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            DbKey::Tip => b"l",
+            DbKey::Block(hash) => hash.as_bytes(),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum BlockchainError {
@@ -15,7 +35,8 @@ pub enum BlockchainError {
 
 #[derive(Debug)]
 pub struct Blockchain {
-    blocks: Vec<Block>,
+    db: DB,
+    tip: Hash,
 }
 
 impl Default for Blockchain {
@@ -26,90 +47,137 @@ impl Default for Blockchain {
 
 impl Blockchain {
     pub fn new() -> Self {
-        let mut chain = Self { blocks: Vec::new() };
-        if let Err(e) = chain.initialize() {
-            // In a real application, you might want to handle this differently
-            panic!("Failed to initialize blockchain: {}", e);
-        }
-        chain
-    }
+        let db = DB::open_default(DB_PATH).unwrap();
 
-    fn initialize(&mut self) -> Result<(), BlockchainError> {
-        let genesis = Block::genesis()?;
-        self.blocks.push(genesis);
-        Ok(())
+        if let Ok(Some(tip)) = db.get(DbKey::Tip) {
+            Self {
+                db,
+                tip: bincode::deserialize(&tip).unwrap(),
+            }
+        } else {
+            let genesis = Block::genesis().unwrap();
+            let tip = genesis.hash();
+            db.put(DbKey::Block(tip), bincode::serialize(&genesis).unwrap())
+                .unwrap();
+            db.put(DbKey::Tip, tip.as_bytes()).unwrap();
+            Self {
+                db,
+                tip: tip.clone(),
+            }
+        }
     }
 
     pub fn add_block(&mut self, data: Vec<u8>) -> Result<(), BlockchainError> {
-        let prev_block = self.last_block()?;
-        let prev_hash = prev_block.hash().clone();
+        let prev_hash =
+            bincode::deserialize(&self.db.get_pinned(DbKey::Tip).unwrap().unwrap()).unwrap();
         let new_block = Block::new(data, prev_hash)?;
 
         // Optional: Validate block before adding
         self.validate_new_block(&new_block)?;
 
-        self.blocks.push(new_block);
+        self.db
+            .put(
+                DbKey::Block(new_block.hash()),
+                bincode::serialize(&new_block).unwrap(),
+            )
+            .unwrap();
+        self.db
+            .put(DbKey::Tip, new_block.hash().as_bytes())
+            .unwrap();
+        self.tip = new_block.hash().clone();
         Ok(())
     }
 
-    pub fn last_block(&self) -> Result<&Block, BlockchainError> {
-        self.blocks.last().ok_or(BlockchainError::EmptyChain)
-    }
-
-    #[allow(dead_code)]
-    pub fn height(&self) -> usize {
-        self.blocks.len()
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
-    }
-
-    #[allow(dead_code)]
-    pub fn get_block(&self, index: usize) -> Option<&Block> {
-        self.blocks.get(index)
-    }
-
-    #[allow(dead_code)]
-    pub fn iter(&self) -> impl Iterator<Item = &Block> {
-        self.blocks.iter()
-    }
-
     fn validate_new_block(&self, block: &Block) -> Result<(), BlockchainError> {
-        let prev_block = self.last_block()?;
+        let last_hasp = &self.tip;
 
-        if block.prev_hash() != prev_block.hash() {
+        if block.prev_hash() != last_hasp {
             return Err(BlockchainError::InvalidBlockSequence);
+        }
+
+        if !ProofOfWork::new(block).validate() {
+            return Err(BlockchainError::BlockError(BlockError::InvalidProofOfWork(
+                block.clone(),
+            )));
         }
 
         Ok(())
     }
 
-    // Optional: Add method to verify the entire chain
     #[allow(dead_code)]
     pub fn verify_chain(&self) -> Result<(), BlockchainError> {
-        for window in self.blocks.windows(2) {
-            let prev_block = &window[0];
-            let current_block = &window[1];
+        let blocks: Vec<Block> = self
+            .iter()
+            // 为了验证创世区块，需要加入一个默认的区块
+            .chain(std::iter::once(Block::default()))
+            .collect();
+
+        // 先遍历到的是最新的区块
+        for window in blocks.windows(2) {
+            let current_block = &window[0];
+            let prev_block = &window[1];
 
             if current_block.prev_hash() != prev_block.hash() {
                 return Err(BlockchainError::InvalidBlockSequence);
             }
+
+            if !ProofOfWork::new(current_block).validate() {
+                return Err(BlockchainError::BlockError(BlockError::InvalidProofOfWork(
+                    current_block.clone(),
+                )));
+            }
         }
         Ok(())
+    }
+
+    /// 返回一个逆序迭代器( 最新的区块在前 )
+    pub fn iter(&self) -> impl Iterator<Item = Block> + '_ {
+        self.into_iter()
     }
 }
 
 impl std::fmt::Display for Blockchain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (i, block) in self.blocks.iter().enumerate() {
+        let chain = self.iter().collect::<Vec<_>>();
+        for (i, block) in chain.iter().rev().enumerate() {
             writeln!(f, "Block #{}", i)?;
             writeln!(f, "{}", block)?;
             writeln!(f, "Pow: {}", ProofOfWork::new(block).validate())?;
             writeln!(f, "----------------")?;
         }
         Ok(())
+    }
+}
+
+/// 逆序迭代器( 最新的区块在前 )
+pub struct BlockchainIterator<'a> {
+    db: &'a DB,
+    current_hash: Hash,
+}
+
+impl<'a> Iterator for BlockchainIterator<'a> {
+    type Item = Block;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let block = self
+            .db
+            .get_pinned(DbKey::Block(&self.current_hash))
+            .unwrap()?;
+        let block: Block = bincode::deserialize(&block).unwrap();
+        self.current_hash = block.prev_hash().clone();
+        Some(block)
+    }
+}
+
+impl<'a> IntoIterator for &'a Blockchain {
+    type Item = Block;
+    type IntoIter = BlockchainIterator<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        BlockchainIterator {
+            db: &self.db,
+            current_hash: self.tip.clone(),
+        }
     }
 }
 
@@ -120,8 +188,7 @@ mod tests {
     #[test]
     fn test_new_blockchain() {
         let blockchain = Blockchain::new();
-        assert_eq!(blockchain.height(), 1);
-        assert!(!blockchain.is_empty());
+        assert_eq!(blockchain.iter().fold(0, |init, _| { init + 1 }), 1);
     }
 
     #[test]
@@ -130,7 +197,7 @@ mod tests {
         blockchain.add_block(b"Test Block 1".to_vec())?;
         blockchain.add_block(b"Test Block 2".to_vec())?;
 
-        assert_eq!(blockchain.height(), 3); // Genesis + 2 blocks
+        assert_eq!(blockchain.iter().fold(0, |init, _| { init + 1 }), 3);
         Ok(())
     }
 
@@ -148,8 +215,7 @@ mod tests {
         let mut blockchain = Blockchain::new();
         blockchain.add_block(b"Test Block".to_vec())?;
 
-        let blocks: Vec<&Block> = blockchain.iter().collect();
-        assert_eq!(blocks.len(), 2); // Genesis + 1 block
+        assert_eq!(blockchain.iter().fold(0, |init, _| { init + 1 }), 2);
         Ok(())
     }
 }
