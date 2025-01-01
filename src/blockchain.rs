@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use crate::{
     block::{Block, BlockError, Hash},
     proof_of_work::ProofOfWork,
+    transaction::{self, Transaction},
 };
 use rocksdb::DB;
 use thiserror::Error;
@@ -39,14 +42,8 @@ pub struct Blockchain {
     tip: Hash,
 }
 
-impl Default for Blockchain {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Blockchain {
-    pub fn new() -> Self {
+    pub fn new(genesis_address: String) -> Self {
         let db = DB::open_default(DB_PATH).unwrap();
 
         if let Ok(Some(tip)) = db.get(DbKey::Tip) {
@@ -55,22 +52,23 @@ impl Blockchain {
                 tip: bincode::deserialize(&tip).unwrap(),
             }
         } else {
-            let genesis = Block::genesis().unwrap();
+            let genesis_tx = Transaction::new_coinbase_tx(genesis_address, "".to_string());
+            let genesis = Block::genesis(genesis_tx).unwrap();
             let tip = genesis.hash();
             db.put(DbKey::Block(tip), bincode::serialize(&genesis).unwrap())
                 .unwrap();
             db.put(DbKey::Tip, tip.as_bytes()).unwrap();
             Self {
                 db,
-                tip: tip.clone(),
+                tip: *tip,
             }
         }
     }
 
-    pub fn add_block(&mut self, data: Vec<u8>) -> Result<(), BlockchainError> {
+    pub fn mine_block(&mut self, transactions: Vec<Transaction>) -> Result<(), BlockchainError> {
         let prev_hash =
             bincode::deserialize(&self.db.get_pinned(DbKey::Tip).unwrap().unwrap()).unwrap();
-        let new_block = Block::new(data, prev_hash)?;
+        let new_block = Block::new(transactions, prev_hash)?;
 
         // Optional: Validate block before adding
         self.validate_new_block(&new_block)?;
@@ -84,7 +82,7 @@ impl Blockchain {
         self.db
             .put(DbKey::Tip, new_block.hash().as_bytes())
             .unwrap();
-        self.tip = new_block.hash().clone();
+        self.tip = *new_block.hash();
         Ok(())
     }
 
@@ -134,6 +132,90 @@ impl Blockchain {
     pub fn iter(&self) -> impl Iterator<Item = Block> + '_ {
         self.into_iter()
     }
+
+    /// 这个方法对所有的未花费交易进行迭代，并对它的值进行累加。当累加值大于或等于amount时，它就会停止并返回累加值，同时返回的还有通过交易 ID 进行分组的输出索引
+    pub fn find_spendable_outputs(
+        &self,
+        address: &str,
+        amount: u32,
+    ) -> (u32, HashMap<Hash, Vec<i32>>) {
+        let mut unspent_outputs = HashMap::new();
+        let mut accumulated = 0;
+
+        'outer: for tx in self.find_unspent_transactions(address) {
+            let txid = tx.id;
+            for (out_id, out) in tx.vout.iter().enumerate() {
+                if out.can_be_unlocked_with(address) && accumulated < amount {
+                    accumulated += out.value;
+                    unspent_outputs
+                        .entry(txid)
+                        .or_insert_with(Vec::new)
+                        .push(out_id as i32);
+                    if accumulated >= amount {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        (accumulated, unspent_outputs)
+    }
+
+    /// 返回一个address的未花费的交易列表
+    pub fn find_unspent_transactions(&self, address: &str) -> Vec<Transaction> {
+        #![allow(non_snake_case)]
+        let mut unspent_TXs = vec![];
+        let mut spent_TXOs = HashMap::new();
+
+        let blocks = self.iter().collect::<Vec<_>>();
+        let transactions = blocks.iter().flat_map(|block| block.transactions());
+
+        // 遍历所有交易，找到已经花费的输出
+        transactions
+            .clone()
+            // 过滤掉 coinbase 交易
+            .filter(|tx| !tx.is_coinbase())
+            // 遍历所有输入
+            .flat_map(|tx| &tx.vin)
+            // 过滤掉不是当前地址的输入
+            .filter(|vin| vin.can_unlock_output_with(address))
+            // 将address已经花费的输出加入spent_TXOs
+            .for_each(|vin| {
+                spent_TXOs
+                    .entry(*vin.txid.as_ref().unwrap())
+                    .or_insert_with(Vec::new)
+                    .push(vin.vout.unwrap());
+            });
+
+        // 遍历所有交易，找到未花费的输出
+        transactions.for_each(|tx| {
+            tx.vout
+                .iter()
+                .enumerate()
+                // 过滤掉已经花费的输出
+                .filter(|(out_id, _)| {
+                    spent_TXOs.get(&tx.id).map_or(true, |spent_outputs| {
+                        !spent_outputs.contains(&(*out_id as i32))
+                    })
+                })
+                // 过滤掉不是当前地址的输出
+                .filter(|(_, vout)| vout.can_be_unlocked_with(address))
+                // 将未花费的输出加入unspent_TXs
+                .for_each(|_| {
+                    unspent_TXs.push(tx.clone());
+                });
+        });
+
+        unspent_TXs
+    }
+
+    pub fn find_utxo(&self, address: &str) -> Vec<transaction::TxOutput> {
+        self.find_unspent_transactions(address)
+            .into_iter()
+            .flat_map(|tx| tx.vout)
+            .filter(|vout| vout.can_be_unlocked_with(address))
+            .collect()
+    }
 }
 
 impl std::fmt::Display for Blockchain {
@@ -164,7 +246,7 @@ impl<'a> Iterator for BlockchainIterator<'a> {
             .get_pinned(DbKey::Block(&self.current_hash))
             .unwrap()?;
         let block: Block = bincode::deserialize(&block).unwrap();
-        self.current_hash = block.prev_hash().clone();
+        self.current_hash = *block.prev_hash();
         Some(block)
     }
 }
@@ -176,46 +258,7 @@ impl<'a> IntoIterator for &'a Blockchain {
     fn into_iter(self) -> Self::IntoIter {
         BlockchainIterator {
             db: &self.db,
-            current_hash: self.tip.clone(),
+            current_hash: self.tip,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_new_blockchain() {
-        let blockchain = Blockchain::new();
-        assert_eq!(blockchain.iter().fold(0, |init, _| { init + 1 }), 1);
-    }
-
-    #[test]
-    fn test_add_block() -> Result<(), BlockchainError> {
-        let mut blockchain = Blockchain::new();
-        blockchain.add_block(b"Test Block 1".to_vec())?;
-        blockchain.add_block(b"Test Block 2".to_vec())?;
-
-        assert_eq!(blockchain.iter().fold(0, |init, _| { init + 1 }), 3);
-        Ok(())
-    }
-
-    #[test]
-    fn test_chain_verification() -> Result<(), BlockchainError> {
-        let mut blockchain = Blockchain::new();
-        blockchain.add_block(b"Test Block".to_vec())?;
-
-        assert!(blockchain.verify_chain().is_ok());
-        Ok(())
-    }
-
-    #[test]
-    fn test_blockchain_iteration() -> Result<(), BlockchainError> {
-        let mut blockchain = Blockchain::new();
-        blockchain.add_block(b"Test Block".to_vec())?;
-
-        assert_eq!(blockchain.iter().fold(0, |init, _| { init + 1 }), 2);
-        Ok(())
     }
 }

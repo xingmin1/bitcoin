@@ -1,10 +1,11 @@
 use generic_array::{typenum, GenericArray};
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-use crate::proof_of_work::ProofOfWork;
+use crate::{proof_of_work::ProofOfWork, transaction::Transaction};
 
 #[derive(Debug, Error)]
 pub enum BlockError {
@@ -18,7 +19,7 @@ pub enum BlockError {
 
 pub type HashArray = GenericArray<u8, typenum::U32>;
 
-#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, Hash, Eq, Copy)]
 pub struct Hash(pub HashArray);
 
 impl Hash {
@@ -30,6 +31,18 @@ impl Hash {
 impl From<HashArray> for Hash {
     fn from(array: HashArray) -> Self {
         Self(array)
+    }
+}
+
+impl From<&[u8]> for Hash {
+    fn from(slice: &[u8]) -> Self {
+        Hash(*HashArray::from_slice(slice))
+    }
+}
+
+impl From<&sha2::digest::Output<Sha256>> for Hash {
+    fn from(hash: &sha2::digest::Output<Sha256>) -> Self {
+        Hash::from(hash.as_slice())
     }
 }
 
@@ -47,19 +60,19 @@ impl std::fmt::Display for Hash {
 // 所有字段都认为是小端序
 pub struct Block {
     timestamp: i64,
-    data: Vec<u8>,
+    transactions: Vec<Transaction>,
     prev_hash: Hash,
     hash: Hash,
     nonce: BigUint,
 }
 
 impl Block {
-    pub fn new(data: Vec<u8>, prev_hash: Hash) -> Result<Self, BlockError> {
+    pub fn new(transactions: Vec<Transaction>, prev_hash: Hash) -> Result<Self, BlockError> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
         let mut block = Self {
             timestamp,
-            data,
+            transactions,
             prev_hash,
             hash: Hash::default(),
             nonce: BigUint::default(),
@@ -71,8 +84,8 @@ impl Block {
         Ok(block)
     }
 
-    pub fn genesis() -> Result<Self, BlockError> {
-        Self::new(b"Genesis Block".to_vec(), Hash::default())
+    pub fn genesis(coinbase_tx: Transaction) -> Result<Self, BlockError> {
+        Self::new(vec![coinbase_tx], Hash::default())
     }
 
     pub fn hash(&self) -> &Hash {
@@ -89,8 +102,14 @@ impl Block {
     }
 
     #[allow(dead_code)]
-    pub fn data(&self) -> &[u8] {
-        &self.data
+    pub fn transactions(&self) -> &Vec<Transaction> {
+        &self.transactions
+    }
+
+    pub fn transactions_hash(&self) -> Hash {
+        Hash::from(&Sha256::digest(
+            bincode::serialize(&self.transactions).expect("Failed to serialize transactions"),
+        ))
     }
 
     #[allow(dead_code)]
@@ -102,33 +121,12 @@ impl Block {
 impl std::fmt::Display for Block {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Timestamp: {}", self.timestamp)?;
-        writeln!(f, "Data: {}", String::from_utf8_lossy(&self.data))?;
+        writeln!(f, "Transactions: ")?;
+        for tx in &self.transactions {
+            writeln!(f, "{}", tx)?;
+        }
         writeln!(f, "Previous Hash: {}", self.prev_hash)?;
         writeln!(f, "Hash: {}", self.hash)?;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_genesis_block() -> Result<(), BlockError> {
-        let genesis = Block::genesis()?;
-        assert_eq!(genesis.data(), b"Genesis Block");
-        assert_eq!(genesis.prev_hash().as_bytes(), Hash::default().as_bytes());
-        Ok(())
-    }
-
-    #[test]
-    fn test_block_creation() -> Result<(), BlockError> {
-        let genesis = Block::genesis()?;
-        let data = b"Test Block".to_vec();
-        let block = Block::new(data.clone(), genesis.hash().clone())?;
-
-        assert_eq!(block.data(), data);
-        assert_eq!(block.prev_hash().as_bytes(), genesis.hash().as_bytes());
         Ok(())
     }
 }

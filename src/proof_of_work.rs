@@ -1,7 +1,7 @@
 use num_bigint::BigUint;
 use sha2::{Digest, Sha256};
 
-use crate::block::{Block, Hash, HashArray};
+use crate::block::{Block, Hash};
 
 const TARGET_BITS: usize = 16;
 
@@ -22,13 +22,13 @@ impl<'a> ProofOfWork<'a> {
         let mut hash;
         let mut hash_int;
 
-        println!("Mining block with data: {:?}", self.block.data());
+        println!("Mining block with data: {:?}", self.block.transactions());
         loop {
             hasher.update(self.prepare_data(&nonce));
             hash = hasher.finalize_reset();
             hash_int = BigUint::from_bytes_le(&hash);
             if hash_int < self.target {
-                let hash = Hash(*HashArray::from_slice(&hash));
+                let hash = Hash::from(&hash);
                 println!("Found hash: {}", hash);
                 println!("Nonce: {}", nonce);
                 println!("\n");
@@ -41,7 +41,7 @@ impl<'a> ProofOfWork<'a> {
     fn prepare_data(&self, nonce: &BigUint) -> Vec<u8> {
         [
             self.block.prev_hash().as_bytes(),
-            self.block.data(),
+            self.block.transactions_hash().as_bytes(),
             self.block.timestamp().to_le_bytes().as_ref(),
             TARGET_BITS.to_le_bytes().as_ref(),
             nonce.to_bytes_le().as_ref(),
