@@ -15,6 +15,8 @@ pub enum BlockError {
     DataEncodingError(#[from] std::string::FromUtf8Error),
     #[error("Invalid proof of work: {0}")]
     InvalidProofOfWork(Block),
+    #[error("Invalid transaction: {0}")]
+    InvalidTransaction(Transaction),
 }
 
 pub type HashArray = GenericArray<u8, typenum::U32>;
@@ -120,13 +122,12 @@ impl Block {
 
 impl std::fmt::Display for Block {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Timestamp: {}", self.timestamp)?;
-        writeln!(f, "Transactions: ")?;
+        writeln!(f, "============ Block {} ============", self.hash)?;
+        writeln!(f, "Prev. block: {}", self.prev_hash)?;
+        writeln!(f, "PoW: {}", ProofOfWork::new(self).validate())?;
         for tx in &self.transactions {
             writeln!(f, "{}", tx)?;
         }
-        writeln!(f, "Previous Hash: {}", self.prev_hash)?;
-        writeln!(f, "Hash: {}", self.hash)?;
-        Ok(())
+        writeln!(f)
     }
 }

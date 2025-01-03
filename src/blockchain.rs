@@ -5,6 +5,7 @@ use crate::{
     proof_of_work::ProofOfWork,
     transaction::{self, Transaction},
 };
+use log::{debug, trace};
 use rocksdb::DB;
 use thiserror::Error;
 
@@ -66,6 +67,13 @@ impl Blockchain {
     }
 
     pub fn mine_block(&mut self, transactions: Vec<Transaction>) -> Result<(), BlockchainError> {
+        for tx in &transactions {
+            if !self.verify_transaction(tx) {
+                return Err(BlockchainError::BlockError(BlockError::InvalidTransaction(
+                    tx.clone(),
+                )));
+            }
+        }
         let prev_hash =
             bincode::deserialize(&self.db.get_pinned(DbKey::Tip).unwrap().unwrap()).unwrap();
         let new_block = Block::new(transactions, prev_hash)?;
@@ -136,16 +144,16 @@ impl Blockchain {
     /// 这个方法对所有的未花费交易进行迭代，并对它的值进行累加。当累加值大于或等于amount时，它就会停止并返回累加值，同时返回的还有通过交易 ID 进行分组的输出索引
     pub fn find_spendable_outputs(
         &self,
-        address: &str,
+        pub_key_hash: &[u8],
         amount: u32,
     ) -> (u32, HashMap<Hash, Vec<i32>>) {
         let mut unspent_outputs = HashMap::new();
         let mut accumulated = 0;
 
-        'outer: for tx in self.find_unspent_transactions(address) {
+        'outer: for tx in self.find_unspent_transactions(pub_key_hash) {
             let txid = tx.id;
             for (out_id, out) in tx.vout.iter().enumerate() {
-                if out.can_be_unlocked_with(address) && accumulated < amount {
+                if out.is_locked_with_key(pub_key_hash) && accumulated < amount {
                     accumulated += out.value;
                     unspent_outputs
                         .entry(txid)
@@ -162,14 +170,13 @@ impl Blockchain {
     }
 
     /// 返回一个address的未花费的交易列表
-    pub fn find_unspent_transactions(&self, address: &str) -> Vec<Transaction> {
+    pub fn find_unspent_transactions(&self, pub_key_hash: &[u8]) -> Vec<Transaction> {
         #![allow(non_snake_case)]
         let mut unspent_TXs = vec![];
         let mut spent_TXOs = HashMap::new();
 
         let blocks = self.iter().collect::<Vec<_>>();
         let transactions = blocks.iter().flat_map(|block| block.transactions());
-
         // 遍历所有交易，找到已经花费的输出
         transactions
             .clone()
@@ -178,7 +185,7 @@ impl Blockchain {
             // 遍历所有输入
             .flat_map(|tx| &tx.vin)
             // 过滤掉不是当前地址的输入
-            .filter(|vin| vin.can_unlock_output_with(address))
+            .filter(|vin| vin.uses_key(pub_key_hash))
             // 将address已经花费的输出加入spent_TXOs
             .for_each(|vin| {
                 spent_TXOs
@@ -186,46 +193,86 @@ impl Blockchain {
                     .or_insert_with(Vec::new)
                     .push(vin.vout.unwrap());
             });
-
+        trace!("spent_TXOs: {:?}", spent_TXOs);
         // 遍历所有交易，找到未花费的输出
         transactions.for_each(|tx| {
             tx.vout
                 .iter()
                 .enumerate()
+                .inspect(|(out_id, vout)| {
+                    trace!("out_id: {}, vout: {:?}", out_id, vout);
+                })
                 // 过滤掉已经花费的输出
                 .filter(|(out_id, _)| {
                     spent_TXOs.get(&tx.id).map_or(true, |spent_outputs| {
                         !spent_outputs.contains(&(*out_id as i32))
                     })
                 })
+                .inspect(|(out_id, vout)| {
+                    trace!("out_id: {}, vout: {:?}", out_id, vout);
+                })
                 // 过滤掉不是当前地址的输出
-                .filter(|(_, vout)| vout.can_be_unlocked_with(address))
+                .filter(|(_, vout)| vout.is_locked_with_key(pub_key_hash))
                 // 将未花费的输出加入unspent_TXs
-                .for_each(|_| {
+                .for_each(|(out_id, vout)| {
+                    trace!("out_id: {}, vout: {:?}", out_id, vout);
                     unspent_TXs.push(tx.clone());
                 });
         });
+        debug!("unspent_TXs: {:?}", unspent_TXs);
 
         unspent_TXs
     }
 
-    pub fn find_utxo(&self, address: &str) -> Vec<transaction::TxOutput> {
-        self.find_unspent_transactions(address)
+    pub fn find_utxo(&self, pub_key_hash: &[u8]) -> Vec<transaction::TxOutput> {
+        self.find_unspent_transactions(pub_key_hash)
             .into_iter()
             .flat_map(|tx| tx.vout)
-            .filter(|vout| vout.can_be_unlocked_with(address))
+            .filter(|vout| vout.is_locked_with_key(pub_key_hash))
             .collect()
+    }
+
+    pub fn find_transaction(&self, id: &Hash) -> Option<Transaction> {
+        self.iter()
+            // TODO: 优化,在blockchain初始化时就将所以区块加载到内存中，防止以后每次都要从磁盘中读取
+            .flat_map(|block| block.transactions().to_vec())
+            .find(|tx| tx.id == *id)
+    }
+
+    pub fn sign_transaction(&self, tx: &mut Transaction, priv_key: secp256k1::SecretKey) {
+        let prev_txs = tx
+            .vin
+            .iter()
+            .map(|vin| {
+                (
+                    vin.txid.unwrap(),
+                    self.find_transaction(&vin.txid.unwrap()).unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        tx.sign(priv_key, &prev_txs);
+    }
+
+    pub fn verify_transaction(&self, tx: &Transaction) -> bool {
+        let prev_txs = tx
+            .vin
+            .iter()
+            .map(|vin| {
+                (
+                    vin.txid.unwrap(),
+                    self.find_transaction(&vin.txid.unwrap()).unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        tx.verify(&prev_txs)
     }
 }
 
 impl std::fmt::Display for Blockchain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let chain = self.iter().collect::<Vec<_>>();
-        for (i, block) in chain.iter().rev().enumerate() {
-            writeln!(f, "Block #{}", i)?;
+        let blocks = self.iter().collect::<Vec<_>>();
+        for block in blocks {
             writeln!(f, "{}", block)?;
-            writeln!(f, "Pow: {}", ProofOfWork::new(block).validate())?;
-            writeln!(f, "----------------")?;
         }
         Ok(())
     }

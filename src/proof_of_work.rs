@@ -1,3 +1,4 @@
+use log::info;
 use num_bigint::BigUint;
 use sha2::{Digest, Sha256};
 
@@ -22,16 +23,16 @@ impl<'a> ProofOfWork<'a> {
         let mut hash;
         let mut hash_int;
 
-        println!("Mining block with data: {:?}", self.block.transactions());
+        info!("Mining block with data: {:?}", self.block.transactions());
         loop {
             hasher.update(self.prepare_data(&nonce));
             hash = hasher.finalize_reset();
             hash_int = BigUint::from_bytes_le(&hash);
             if hash_int < self.target {
                 let hash = Hash::from(&hash);
-                println!("Found hash: {}", hash);
-                println!("Nonce: {}", nonce);
-                println!("\n");
+                info!("Found hash: {}", hash);
+                info!("Nonce: {}", nonce);
+                info!("\n");
                 return (nonce, hash);
             }
             nonce += 1u32;

@@ -5,6 +5,7 @@ mod block;
 mod blockchain;
 mod proof_of_work;
 mod transaction;
+mod wallet;
 
 use blockchain::Blockchain;
 use transaction::Transaction;
@@ -25,12 +26,7 @@ enum Commands {
         address: String,
     },
 
-    /// Add a new block with the given data
-    // Add {
-    //     /// The data to store in the block
-    //     #[arg(short, long)]
-    //     data: String,
-    // },
+    /// Send a transaction
     Send {
         /// The sender's address
         #[clap(short, long)]
@@ -51,8 +47,14 @@ enum Commands {
         address: String,
     },
 
+    /// Create a new wallet
+    CreateWallet,
+
+    /// List all addresses
+    ListAddresses,
+
     /// List all blocks in the chain
-    List,
+    PrintChain,
 
     /// Verify the blockchain's integrity
     Verify,
@@ -71,15 +73,21 @@ impl BlockchainApp {
     }
 
     fn send(&mut self, from: String, to: String, amount: u32) -> Result<()> {
+        if !(wallet::validate_address(&from) && wallet::validate_address(&to)) {
+            return Err(anyhow::anyhow!("Invalid address"));
+        }
+
         let tx = Transaction::new_utxo_transaction(from, to, amount, &self.chain);
         self.chain.mine_block(vec![tx])?;
         Ok(())
     }
 
     fn get_balance(&self, address: String) -> Result<()> {
+        let decoded = bs58::decode(&address).into_vec().unwrap();
+        let pub_key_hash = &decoded[1..decoded.len() - 4];
         let balance = self
             .chain
-            .find_utxo(&address)
+            .find_utxo(pub_key_hash)
             .into_iter()
             .map(|out| out.value)
             .sum::<u32>();
@@ -87,9 +95,8 @@ impl BlockchainApp {
         Ok(())
     }
 
-    fn list_blocks(&self) -> Result<()> {
+    fn list_blocks(&self) {
         println!("{}", self.chain);
-        Ok(())
     }
 
     fn verify_chain(&self) -> Result<()> {
@@ -97,23 +104,47 @@ impl BlockchainApp {
         println!("Blockchain verification passed!");
         Ok(())
     }
+
+    fn create_wallet() -> String {
+        let mut wallets = wallet::Wallets::new();
+        let address = wallets.create_wallet();
+        wallets.save_to_file();
+        address
+    }
+
+    fn list_addresses() {
+        let wallets = wallet::Wallets::new();
+        let addresses = wallets.get_addresses();
+        for address in addresses {
+            println!("{}", address);
+        }
+    }
 }
 
 fn main() -> Result<()> {
+    // The `Env` lets us tweak what the environment
+    // variables to read are and what the default
+    // value is if they're missing
+    let env = env_logger::Env::default()
+        .filter_or("LOG_LEVEL", "warn")
+        .write_style_or("LOG_STYLE", "always");
+
+    env_logger::init_from_env(env);
+
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init {address} => {
+        Commands::Init { address } => {
             println!("Initialized new blockchain");
-            
+
             let app = BlockchainApp::new(address)?;
-            app.list_blocks()?;
+            app.list_blocks();
         }
 
         Commands::Send { from, to, amount } => {
             let mut app = BlockchainApp::new(from.clone())?;
             app.send(from, to, amount)?;
-            app.list_blocks()?;
+            app.list_blocks();
         }
 
         Commands::GetBalance { address } => {
@@ -121,14 +152,22 @@ fn main() -> Result<()> {
             app.get_balance(address)?;
         }
 
-        Commands::List => {
+        Commands::PrintChain => {
             let app = BlockchainApp::new("".to_string())?;
-            app.list_blocks()?;
+            app.list_blocks();
         }
 
         Commands::Verify => {
             let app = BlockchainApp::new("".to_string())?;
             app.verify_chain()?;
+        }
+
+        Commands::CreateWallet => {
+            println!("New wallet created with address: {}", BlockchainApp::create_wallet());
+        }
+
+        Commands::ListAddresses => {
+            BlockchainApp::list_addresses();
         }
     }
 
@@ -137,22 +176,41 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use log::warn;
+
     use super::*;
+    use std::fs;
 
     #[test]
-    fn test_blockchain_app() -> Result<()> {
-        let mut app = BlockchainApp::new("Alice".to_string())?;
+    fn test() {
+        let env = env_logger::Env::default()
+            .filter_or("RUST_LOG", "debug")
+            .write_style_or("RUST_LOG_STYLE", "always");
 
-        // Add some blocks
-        app.send("Alice".to_string(), "Bob".to_string(), 10)?;
-        app.send("Bob".to_string(), "Charlie".to_string(), 5)?;
+        env_logger::init_from_env(env);
 
-        // Verify chain
-        app.verify_chain()?;
+        let _ = fs::remove_file("wallets.dat").inspect_err(|e| {
+            warn!("Failed to remove wallets.dat: {}", e);
+        });
+        let _ = fs::remove_dir_all("blockchain.db").inspect_err(|e| {
+            warn!("Failed to remove blockchain.db: {}", e);
+        });
+        let a = BlockchainApp::create_wallet();
+        let b = BlockchainApp::create_wallet();
+        let c = BlockchainApp::create_wallet();
+        let mut app = BlockchainApp::new(a.clone()).unwrap();
+        app.send(a.clone(), b.clone(), 15).unwrap();
+        app.send(b.clone(), c.clone(), 5).unwrap();
+        app.get_balance(a.clone()).unwrap();
+        app.get_balance(b.clone()).unwrap();
+        app.get_balance(c.clone()).unwrap();
 
-        // List blocks
-        app.list_blocks()?;
+        app.list_blocks();
+        app.verify_chain().unwrap();
 
-        Ok(())
+        BlockchainApp::list_addresses();
+
+        let _ = fs::remove_dir("wallets.dat");
+        let _ = fs::remove_dir("blockchain.db");
     }
 }
