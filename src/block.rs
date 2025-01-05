@@ -1,11 +1,11 @@
 use generic_array::{typenum, GenericArray};
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-use crate::{proof_of_work::ProofOfWork, transaction::Transaction};
+use crate::{merkle_tree::MerkleTree, proof_of_work::ProofOfWork, transaction::Transaction};
 
 #[derive(Debug, Error)]
 pub enum BlockError {
@@ -109,10 +109,11 @@ impl Block {
         &self.transactions
     }
 
-    pub fn transactions_hash(&self) -> Hash {
-        Hash::from(&Sha256::digest(
-            bincode::serialize(&self.transactions).expect("Failed to serialize transactions"),
-        ))
+    pub fn hash_transactions(&self) -> Hash {
+        // Hash::from(&Sha256::digest(
+        //     bincode::serialize(&self.transactions).expect("Failed to serialize transactions"),
+        // ))
+        MerkleTree::new(self.transactions.clone()).root().unwrap()
     }
 
     #[allow(dead_code)]

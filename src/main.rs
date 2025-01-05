@@ -7,6 +7,7 @@ mod proof_of_work;
 mod transaction;
 mod utxo_set;
 mod wallet;
+mod merkle_tree;
 
 use blockchain::Blockchain;
 use transaction::Transaction;

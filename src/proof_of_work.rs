@@ -42,7 +42,7 @@ impl<'a> ProofOfWork<'a> {
     fn prepare_data(&self, nonce: &BigUint) -> Vec<u8> {
         [
             self.block.prev_hash().as_bytes(),
-            self.block.transactions_hash().as_bytes(),
+            self.block.hash_transactions().as_bytes(),
             self.block.timestamp().to_le_bytes().as_ref(),
             TARGET_BITS.to_le_bytes().as_ref(),
             nonce.to_bytes_le().as_ref(),
