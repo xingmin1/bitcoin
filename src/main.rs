@@ -5,10 +5,12 @@ mod block;
 mod blockchain;
 mod proof_of_work;
 mod transaction;
+mod utxo_set;
 mod wallet;
 
 use blockchain::Blockchain;
 use transaction::Transaction;
+use utxo_set::UtxoSet;
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -62,14 +64,15 @@ enum Commands {
 
 #[derive(Debug)]
 struct BlockchainApp {
-    chain: Blockchain,
+    pub utxo_set: UtxoSet,
 }
 
 impl BlockchainApp {
     fn new(address: String) -> Result<Self> {
-        Ok(Self {
-            chain: Blockchain::new(address),
-        })
+        let chain = Blockchain::new(address);
+        let utxo_set = UtxoSet::new(chain);
+        utxo_set.reindex();
+        Ok(Self { utxo_set })
     }
 
     fn send(&mut self, from: String, to: String, amount: u32) -> Result<()> {
@@ -77,8 +80,10 @@ impl BlockchainApp {
             return Err(anyhow::anyhow!("Invalid address"));
         }
 
-        let tx = Transaction::new_utxo_transaction(from, to, amount, &self.chain);
-        self.chain.mine_block(vec![tx])?;
+        let tx = Transaction::new_utxo_transaction(from.clone(), to, amount, &self.utxo_set);
+        let coinbase_tx = Transaction::new_coinbase_tx(from, "".to_string());
+        let block = self.utxo_set.blockchain.mine_block(vec![tx, coinbase_tx])?;
+        self.utxo_set.update(&block);
         Ok(())
     }
 
@@ -86,21 +91,21 @@ impl BlockchainApp {
         let decoded = bs58::decode(&address).into_vec().unwrap();
         let pub_key_hash = &decoded[1..decoded.len() - 4];
         let balance = self
-            .chain
+            .utxo_set
             .find_utxo(pub_key_hash)
             .into_iter()
-            .map(|out| out.value)
+            .map(|output| output.value)
             .sum::<u32>();
         println!("Balance of '{}': {}", address, balance);
         Ok(())
     }
 
     fn list_blocks(&self) {
-        println!("{}", self.chain);
+        println!("{}", self.utxo_set.blockchain);
     }
 
     fn verify_chain(&self) -> Result<()> {
-        self.chain.verify_chain()?;
+        self.utxo_set.blockchain.verify_chain()?;
         println!("Blockchain verification passed!");
         Ok(())
     }
@@ -163,7 +168,10 @@ fn main() -> Result<()> {
         }
 
         Commands::CreateWallet => {
-            println!("New wallet created with address: {}", BlockchainApp::create_wallet());
+            println!(
+                "New wallet created with address: {}",
+                BlockchainApp::create_wallet()
+            );
         }
 
         Commands::ListAddresses => {
@@ -201,6 +209,7 @@ mod tests {
         let mut app = BlockchainApp::new(a.clone()).unwrap();
         app.send(a.clone(), b.clone(), 15).unwrap();
         app.send(b.clone(), c.clone(), 5).unwrap();
+        app.send(a.clone(), a.clone(), 10).unwrap();
         app.get_balance(a.clone()).unwrap();
         app.get_balance(b.clone()).unwrap();
         app.get_balance(c.clone()).unwrap();

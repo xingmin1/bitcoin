@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fmt::Display};
 
-use crate::{block::Hash, blockchain::Blockchain, wallet::{self, Wallets}};
+use crate::{
+    block::Hash, utxo_set::UtxoSet, wallet::{self, Wallets}
+};
 
 const COINBASE_AMOUNT: u32 = 50;
 
@@ -12,6 +14,13 @@ const COINBASE_AMOUNT: u32 = 50;
 pub struct TxOutput {
     pub value: u32,
     pub pub_key_hash: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TxOutputs {
+    pub outputs: Vec<TxOutput>,
+    /// 输出所在的索引
+    pub out_idxs: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,7 +182,7 @@ impl Transaction {
         self.vin.len() == 1 && self.vin[0].txid.is_none() && self.vin[0].vout.is_none()
     }
 
-    pub fn new_utxo_transaction(from: String, to: String, amount: u32, bc: &Blockchain) -> Self {
+    pub fn new_utxo_transaction(from: String, to: String, amount: u32, utxo_set: &UtxoSet) -> Self {
         let mut inputs = vec![];
         let mut outputs = vec![];
 
@@ -182,7 +191,7 @@ impl Transaction {
         let pub_key_hash = wallet::hash_pub_key(&wallet.public_key);
         trace!("new_utxo_transaction pub_key_hash: {:?}", pub_key_hash);
 
-        let (acc, valid_outputs) = bc.find_spendable_outputs(&pub_key_hash, amount);
+        let (acc, valid_outputs) = utxo_set.find_spendable_outputs(&pub_key_hash, amount);
         if acc < amount {
             panic!("ERROR: Not enough funds");
         }
@@ -219,7 +228,7 @@ impl Transaction {
             vout: outputs,
         };
         tx.id = tx.hash();
-        bc.sign_transaction(&mut tx, wallet.private_key);
+        utxo_set.blockchain.sign_transaction(&mut tx, wallet.private_key);
         tx
     }
 }

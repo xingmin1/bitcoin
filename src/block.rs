@@ -49,6 +49,7 @@ impl From<&sha2::digest::Output<Sha256>> for Hash {
 }
 
 impl std::fmt::Display for Hash {
+    /// 将 Hash 以十六进制的形式输出(小端序)，Lowercase hexadecimal encoding，即小端16进制编码
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // 先遍历到的是低地址（即低位，小端序），所以要反转，这样输出的时候才是高位在前
         for byte in self.0.iter().rev() {

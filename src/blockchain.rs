@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use crate::{
     block::{Block, BlockError, Hash},
     proof_of_work::ProofOfWork,
-    transaction::{self, Transaction},
+    transaction::{Transaction, TxOutputs},
 };
-use log::{debug, trace};
+use log::trace;
 use rocksdb::DB;
 use thiserror::Error;
 
@@ -50,7 +50,7 @@ impl Blockchain {
         if let Ok(Some(tip)) = db.get(DbKey::Tip) {
             Self {
                 db,
-                tip: bincode::deserialize(&tip).unwrap(),
+                tip: Hash::from(tip.as_slice()),
             }
         } else {
             let genesis_tx = Transaction::new_coinbase_tx(genesis_address, "".to_string());
@@ -59,14 +59,11 @@ impl Blockchain {
             db.put(DbKey::Block(tip), bincode::serialize(&genesis).unwrap())
                 .unwrap();
             db.put(DbKey::Tip, tip.as_bytes()).unwrap();
-            Self {
-                db,
-                tip: *tip,
-            }
+            Self { db, tip: *tip }
         }
     }
 
-    pub fn mine_block(&mut self, transactions: Vec<Transaction>) -> Result<(), BlockchainError> {
+    pub fn mine_block(&mut self, transactions: Vec<Transaction>) -> Result<Block, BlockchainError> {
         for tx in &transactions {
             if !self.verify_transaction(tx) {
                 return Err(BlockchainError::BlockError(BlockError::InvalidTransaction(
@@ -91,7 +88,7 @@ impl Blockchain {
             .put(DbKey::Tip, new_block.hash().as_bytes())
             .unwrap();
         self.tip = *new_block.hash();
-        Ok(())
+        Ok(new_block)
     }
 
     fn validate_new_block(&self, block: &Block) -> Result<(), BlockchainError> {
@@ -141,39 +138,9 @@ impl Blockchain {
         self.into_iter()
     }
 
-    /// 这个方法对所有的未花费交易进行迭代，并对它的值进行累加。当累加值大于或等于amount时，它就会停止并返回累加值，同时返回的还有通过交易 ID 进行分组的输出索引
-    pub fn find_spendable_outputs(
-        &self,
-        pub_key_hash: &[u8],
-        amount: u32,
-    ) -> (u32, HashMap<Hash, Vec<i32>>) {
-        let mut unspent_outputs = HashMap::new();
-        let mut accumulated = 0;
-
-        'outer: for tx in self.find_unspent_transactions(pub_key_hash) {
-            let txid = tx.id;
-            for (out_id, out) in tx.vout.iter().enumerate() {
-                if out.is_locked_with_key(pub_key_hash) && accumulated < amount {
-                    accumulated += out.value;
-                    unspent_outputs
-                        .entry(txid)
-                        .or_insert_with(Vec::new)
-                        .push(out_id as i32);
-                    if accumulated >= amount {
-                        break 'outer;
-                    }
-                }
-            }
-        }
-
-        (accumulated, unspent_outputs)
-    }
-
-    /// 返回一个address的未花费的交易列表
-    pub fn find_unspent_transactions(&self, pub_key_hash: &[u8]) -> Vec<Transaction> {
-        #![allow(non_snake_case)]
-        let mut unspent_TXs = vec![];
-        let mut spent_TXOs = HashMap::new();
+    pub fn find_utxo(&self) -> HashMap<Hash, TxOutputs> {
+        let mut utxo = HashMap::new();
+        let mut spent_txos = HashMap::new();
 
         let blocks = self.iter().collect::<Vec<_>>();
         let transactions = blocks.iter().flat_map(|block| block.transactions());
@@ -184,16 +151,14 @@ impl Blockchain {
             .filter(|tx| !tx.is_coinbase())
             // 遍历所有输入
             .flat_map(|tx| &tx.vin)
-            // 过滤掉不是当前地址的输入
-            .filter(|vin| vin.uses_key(pub_key_hash))
             // 将address已经花费的输出加入spent_TXOs
             .for_each(|vin| {
-                spent_TXOs
+                spent_txos
                     .entry(*vin.txid.as_ref().unwrap())
                     .or_insert_with(Vec::new)
                     .push(vin.vout.unwrap());
             });
-        trace!("spent_TXOs: {:?}", spent_TXOs);
+        trace!("spent_txos: {:?}", spent_txos);
         // 遍历所有交易，找到未花费的输出
         transactions.for_each(|tx| {
             tx.vout
@@ -204,32 +169,25 @@ impl Blockchain {
                 })
                 // 过滤掉已经花费的输出
                 .filter(|(out_id, _)| {
-                    spent_TXOs.get(&tx.id).map_or(true, |spent_outputs| {
+                    spent_txos.get(&tx.id).map_or(true, |spent_outputs| {
                         !spent_outputs.contains(&(*out_id as i32))
                     })
                 })
-                .inspect(|(out_id, vout)| {
-                    trace!("out_id: {}, vout: {:?}", out_id, vout);
-                })
-                // 过滤掉不是当前地址的输出
-                .filter(|(_, vout)| vout.is_locked_with_key(pub_key_hash))
-                // 将未花费的输出加入unspent_TXs
+                // 将未花费的输出加入utxo
                 .for_each(|(out_id, vout)| {
                     trace!("out_id: {}, vout: {:?}", out_id, vout);
-                    unspent_TXs.push(tx.clone());
+                    utxo.entry(tx.id)
+                        .or_insert_with(TxOutputs::default)
+                        .outputs
+                        .push(vout.clone());
+                    utxo.entry(tx.id)
+                        .or_insert_with(TxOutputs::default)
+                        .out_idxs
+                        .push(out_id as i32);
                 });
         });
-        debug!("unspent_TXs: {:?}", unspent_TXs);
 
-        unspent_TXs
-    }
-
-    pub fn find_utxo(&self, pub_key_hash: &[u8]) -> Vec<transaction::TxOutput> {
-        self.find_unspent_transactions(pub_key_hash)
-            .into_iter()
-            .flat_map(|tx| tx.vout)
-            .filter(|vout| vout.is_locked_with_key(pub_key_hash))
-            .collect()
+        utxo
     }
 
     pub fn find_transaction(&self, id: &Hash) -> Option<Transaction> {
@@ -254,6 +212,10 @@ impl Blockchain {
     }
 
     pub fn verify_transaction(&self, tx: &Transaction) -> bool {
+        if tx.is_coinbase() {
+            return true;
+        }
+
         let prev_txs = tx
             .vin
             .iter()
