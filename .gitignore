@@ -1,4 +1,4 @@
 /target
 /blockchain.db
-wallets.dat
+/wallets.dat
 /utxo_set.db
