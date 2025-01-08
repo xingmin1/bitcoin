@@ -1,8 +1,14 @@
 use anyhow::Result;
-use clap::{self, Subcommand};
-use clap::{command, Parser};
+use blockchain::Blockchain;
+use log::{debug, info, warn};
+use network::{Message, MessageData, Node};
+use secp256k1::rand::{self, Rng};
+use std::sync::{Arc, Mutex};
+use utxo_set::UtxoSet;
+
 mod block;
 mod blockchain;
+mod cli;
 mod merkle_tree;
 mod network;
 mod proof_of_work;
@@ -10,128 +16,48 @@ mod transaction;
 mod utxo_set;
 mod wallet;
 
-use blockchain::Blockchain;
-use transaction::Transaction;
-use utxo_set::UtxoSet;
-
-#[derive(Parser)]
-#[clap(author, version, about, long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Initialize a new blockchain
-    Init {
-        /// The address to send the genesis block's reward to
-        #[clap(short, long)]
-        address: String,
-    },
-
-    /// Send a transaction
-    Send {
-        /// The sender's address
-        #[clap(short, long)]
-        from: String,
-
-        /// The recipient's address
-        #[clap(short, long)]
-        to: String,
-
-        /// The amount to send
-        #[clap(short, long)]
-        amount: u32,
-    },
-
-    GetBalance {
-        /// The address to check
-        #[clap(short, long)]
-        address: String,
-    },
-
-    /// Create a new wallet
-    CreateWallet,
-
-    /// List all addresses
-    ListAddresses,
-
-    /// List all blocks in the chain
-    PrintChain,
-
-    /// Verify the blockchain's integrity
-    Verify,
-}
-
-#[derive(Debug)]
-struct BlockchainApp<'a> {
-    pub utxo_set: &'a mut UtxoSet,
-}
-
-impl<'a> BlockchainApp<'a> {
-    fn new(utxo_set: &'a mut UtxoSet) -> Self {
-        Self { utxo_set }
-    }
-
-    fn send(&mut self, from: String, to: String, amount: u32, path_prefix: &str) -> Result<()> {
-        if !(wallet::validate_address(&from) && wallet::validate_address(&to)) {
-            return Err(anyhow::anyhow!("Invalid address"));
-        }
-
-        let tx = Transaction::new_utxo_transaction(
-            from.clone(),
-            to,
-            amount,
-            &self.utxo_set,
-            path_prefix,
-        );
-        let coinbase_tx = Transaction::new_coinbase_tx(from, "".to_string());
-        let block = self.utxo_set.blockchain.mine_block(vec![tx, coinbase_tx])?;
-        self.utxo_set.update(&block, path_prefix);
-        Ok(())
-    }
-
-    fn get_balance(&self, address: String, path_prefix: &str) -> Result<()> {
-        let decoded = bs58::decode(&address).into_vec().unwrap();
-        let pub_key_hash = &decoded[1..decoded.len() - 4];
-        let balance = self
-            .utxo_set
-            .find_utxo(pub_key_hash, path_prefix)
-            .into_iter()
-            .map(|output| output.value)
-            .sum::<u32>();
-        println!("Balance of '{}': {}", address, balance);
-        Ok(())
-    }
-
-    fn list_blocks(&self) {
-        println!("{}", self.utxo_set.blockchain);
-    }
-
-    fn verify_chain(&self) -> Result<()> {
-        self.utxo_set.blockchain.verify_chain()?;
-        println!("Blockchain verification passed!");
-        Ok(())
-    }
-
-    fn create_wallet(path_prefix: &str) -> String {
-        let mut wallets = wallet::Wallets::new(path_prefix);
-        let address = wallets.create_wallet();
-        wallets.save_to_file(path_prefix);
-        address
-    }
-
-    fn list_addresses(path_prefix: &str) {
-        let wallets = wallet::Wallets::new(path_prefix);
-        let addresses = wallets.get_addresses();
-        for address in addresses {
-            println!("{}", address);
-        }
-    }
-}
-
 fn main() -> Result<()> {
+    init_logger();
+    info!("比特币节点模拟程序启动");
+
+    let nodes = Node::create_nodes(2);
+    info!("创建了 {} 个节点", nodes.len());
+
+    let mut tasks = Vec::new();
+    let final_nodes = Arc::new(Mutex::new(Vec::new()));
+
+    for node in nodes {
+        let final_nodes = Arc::clone(&final_nodes);
+        tasks.push(std::thread::spawn(move || -> Result<()> {
+            let final_node = task(node)?;
+            final_nodes.lock().unwrap().push(final_node);
+            Ok(())
+        }));
+    }
+
+    for task in tasks {
+        task.join().unwrap().unwrap();
+    }
+
+    // 打印最终状态
+    let final_nodes = final_nodes.lock().unwrap();
+    warn!("=== 最终区块链状态 ===");
+    for node in final_nodes.iter() {
+        if let Some(utxo_set) = &node.utxo_set {
+            let blockchain = &utxo_set.blockchain;
+            warn!("节点 {}: ", node.id);
+            warn!("  区块链长度: {}", blockchain.length);
+            warn!("  最新区块哈希: {}", blockchain.tip);
+            warn!("  区块链为 {}", blockchain);
+            warn!("  账户地址: {}", node.wallets.get_addresses()[0]);
+        }
+    }
+    warn!("所有节点任务完成");
+
+    Ok(())
+}
+
+fn init_logger() {
     // The `Env` lets us tweak what the environment
     // variables to read are and what the default
     // value is if they're missing
@@ -140,59 +66,108 @@ fn main() -> Result<()> {
         .write_style_or("LOG_STYLE", "always");
 
     env_logger::init_from_env(env);
-
-    Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
+fn task(mut node: Node) -> Result<Node> {
+    info!("节点 {} 开始运行", node.id);
+    node.send_address_to_all();
 
-    #[test]
-    fn test() {
-        let env = env_logger::Env::default()
-            .filter_or("RUST_LOG", "debug")
-            .write_style_or("RUST_LOG_STYLE", "always");
+    let sleep_time = rand::thread_rng().gen_range(0..=10000);
+    std::thread::sleep(std::time::Duration::from_millis(sleep_time));
 
-        env_logger::init_from_env(env);
+    for round in 0..2 {
+        debug!("节点 {} 开始第 {} 轮任务", node.id, round + 1);
+        wait_for_message(&mut node);
 
-        // 创建测试目录
-        let _ = std::fs::remove_dir_all("data/test");
-        std::fs::create_dir_all("data/test").unwrap();
+        if node.utxo_set.is_none() {
+            info!("节点 {} 创建新的区块链", node.id);
+            let (blockchain, genesis) = Blockchain::new(
+                node.wallets.get_addresses()[0].clone(),
+                &Node::path_prefix(node.id),
+            );
+            let utxo_set = UtxoSet::new(blockchain);
+            utxo_set.reindex(&Node::path_prefix(node.id));
+            node.utxo_set = Some(utxo_set);
+            if let Some(genesis) = genesis {
+                debug!("节点 {} 发送创世区块给所有节点", node.id);
+                node.send_message_to_all(Message::new(node.id, MessageData::Block { block_chain_length: 1, block: genesis }));
+            }
+        }
 
-        let path_prefix = "data/test";
-        let a = BlockchainApp::create_wallet(path_prefix);
-        let b = BlockchainApp::create_wallet(path_prefix);
-        let c = BlockchainApp::create_wallet(path_prefix);
+        while node.addresses.is_empty() {
+            wait_for_message(&mut node);
+        }
 
-        // 创建区块链和 UTXO 集合
-        let blockchain = Blockchain::new(a.clone(), path_prefix);
-        let mut utxo_set = UtxoSet::new(blockchain);
+        // let send_count = rand::thread_rng().gen_range(1..=10);
 
-        // 手动更新 UTXO 集合，确保包含创世区块的交易
-        utxo_set.reindex(path_prefix);
+        for _ in 0..(3-round) {
+            debug!("节点 {} 开始转账", node.id);
+            let to_ids = node.addresses.keys().cloned().collect::<Vec<_>>();
+            let to_id = to_ids[rand::thread_rng().gen_range(0..to_ids.len())];
+            let amount = rand::thread_rng().gen_range(1..=3);
+            let balance = node.utxo_set.as_ref().unwrap().get_balance(node.wallets.get_addresses()[0], &Node::path_prefix(node.id));
+            if balance < amount {
+                continue;
+            }
+            debug!("节点 {} 向节点 {} 转账 {} 个币", node.id, to_id, amount);
+            node.send(to_id, amount);
+        }
 
-        let mut app = BlockchainApp::new(&mut utxo_set);
+        // 设置等待超时时间为100ms
+        let start_time = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(100);
 
-        // 打印初始余额
-        app.get_balance(a.clone(), path_prefix).unwrap();
-        app.get_balance(b.clone(), path_prefix).unwrap();
-        app.get_balance(c.clone(), path_prefix).unwrap();
+        while node.transaction_cache.len() < 2 && start_time.elapsed() < timeout {
+            debug!(
+                "节点 {} 等待交易，当前缓存交易数: {}",
+                node.id,
+                node.transaction_cache.len()
+            );
+            wait_for_message(&mut node);
+        }
 
-        app.send(a.clone(), b.clone(), 15, path_prefix).unwrap();
-        app.send(b.clone(), c.clone(), 5, path_prefix).unwrap();
-        app.send(a.clone(), a.clone(), 10, path_prefix).unwrap();
+        if node.transaction_cache.is_empty() {
+            continue;
+        }
+        info!("节点 {} 开始挖矿", node.id);
+        node.mine();
+        info!("节点 {} 完成挖矿", node.id);
+    }
 
-        app.get_balance(a.clone(), path_prefix).unwrap();
-        app.get_balance(b.clone(), path_prefix).unwrap();
-        app.get_balance(c.clone(), path_prefix).unwrap();
+    info!("节点 {} 完成所有任务", node.id);
+    wait_for_handle(&mut node);
+    Ok(node)
+}
 
-        app.list_blocks();
-        app.verify_chain().unwrap();
+/// 在一段时间内等待消息
+fn wait_for_message(node: &mut Node) {
+    // 设置等待时间为[0, 10]ms
+    let duration = std::time::Duration::from_millis(rand::thread_rng().gen_range(0..=10));
+    let start_time = std::time::Instant::now();
 
-        BlockchainApp::list_addresses(path_prefix);
+    // 在指定时间内循环接收消息
+    while start_time.elapsed() < duration {
+        // 尝试接收消息，设置超时时间为剩余时间
+        if let Ok(message) = node
+            .recv_channel
+            .recv_timeout(duration.saturating_sub(start_time.elapsed()))
+        {
+            debug!("节点 {} 收到来自节点 {} 的消息", node.id, message.from_id);
+            // 处理收到的消息
+            let msg_id = message.from_id;
+            message.handle(node, msg_id);
+        }
+    }
+}
 
-        std::fs::remove_dir_all("data/test").unwrap();
+fn wait_for_handle(node: &mut Node) {
+    let start_time = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(1000);
+    while start_time.elapsed() < timeout {
+        if let Ok(message) = node.recv_channel.recv_timeout(timeout.saturating_sub(start_time.elapsed())) {
+            debug!("节点 {} 收到来自节点 {} 的消息", node.id, message.from_id);
+            let msg_id = message.from_id;
+            message.handle(node, msg_id);
+        }
     }
 }

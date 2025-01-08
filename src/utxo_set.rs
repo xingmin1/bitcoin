@@ -98,6 +98,13 @@ impl UtxoSet {
         utxos
     }
 
+    pub fn get_balance(&self, address: &str, path_prefix: &str) -> u32 {
+        let decoded = bs58::decode(address).into_vec().unwrap();
+        let pub_key_hash = &decoded[1..decoded.len() - 4];
+        let utxos = self.find_utxo(pub_key_hash, path_prefix);
+        utxos.iter().map(|output| output.value).sum()
+    }
+
     /// 更新UTXO集合
     ///
     /// 处理新区块中的所有交易：

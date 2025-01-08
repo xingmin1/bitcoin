@@ -2,6 +2,8 @@ use secp256k1::{rand::rngs::OsRng, Secp256k1};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
+use crate::blockchain::Blockchain;
+
 const VERSION: u8 = 0x00;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Deserialize)]

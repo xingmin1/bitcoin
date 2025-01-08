@@ -47,16 +47,19 @@ pub struct Blockchain {
 }
 
 impl Blockchain {
-    pub fn new(genesis_address: String, path_prefix: &str) -> Self {
+    pub fn new(genesis_address: String, path_prefix: &str) -> (Self, Option<Block>) {
         let db = DB::open_default(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
 
         if let Ok(Some(tip)) = db.get(DbKey::Tip) {
             let length = db.get(DbKey::Length).unwrap().unwrap();
-            Self {
-                db,
-                tip: Hash::from(tip.as_slice()),
-                length: bincode::deserialize(&length).unwrap(),
-            }
+            (
+                Self {
+                    db,
+                    tip: Hash::from(tip.as_slice()),
+                    length: bincode::deserialize(&length).unwrap(),
+                },
+                None,
+            )
         } else {
             debug!("create genesis block");
 
@@ -66,8 +69,16 @@ impl Blockchain {
             db.put(DbKey::Block(tip), bincode::serialize(&genesis).unwrap())
                 .unwrap();
             db.put(DbKey::Tip, tip.as_bytes()).unwrap();
-            db.put(DbKey::Length, bincode::serialize(&1).unwrap()).unwrap();
-            Self { db, tip: *tip, length: 1 }
+            db.put(DbKey::Length, bincode::serialize(&1).unwrap())
+                .unwrap();
+            (
+                Self {
+                    db,
+                    tip: *tip,
+                    length: 1,
+                },
+                Some(genesis),
+            )
         }
     }
 
@@ -75,16 +86,24 @@ impl Blockchain {
         let db = DB::open_default(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
         let tip = *blocks.last().unwrap().hash();
         db.put(DbKey::Tip, tip.as_bytes()).unwrap();
-        db.put(DbKey::Length, bincode::serialize(&(blocks.len() as u64)).unwrap()).unwrap();
+        db.put(
+            DbKey::Length,
+            bincode::serialize(&(blocks.len() as u64)).unwrap(),
+        )
+        .unwrap();
         let length = blocks.len() as u64;
         for block in blocks {
-            db.put(DbKey::Block(block.hash()), bincode::serialize(&block).unwrap()).unwrap();
+            db.put(
+                DbKey::Block(block.hash()),
+                bincode::serialize(&block).unwrap(),
+            )
+            .unwrap();
         }
         Self { db, tip, length }
     }
 
     /// 更新区块链，传入的区块集合必须合法
-    /// 
+    ///
     /// 更新规则:
     /// 1. 如果传入的区块集合为空，则不更新
     /// 2. 如果传入的区块集合不合法，则不更新
@@ -97,11 +116,17 @@ impl Blockchain {
         if Self::verify_blocks(&blocks).is_err() {
             return;
         }
-        
+
         if blocks.last().unwrap().prev_hash != self.tip {
-            assert_eq!(blocks.last().unwrap().prev_hash, Hash::default(), "区块链的创世纪区块的prev_hash必须为0");
-            assert!(blocks.len() > self.length as usize, "要替换的区块链长度必须大于当前区块链长度");
-            
+            assert_eq!(
+                blocks.last().unwrap().prev_hash,
+                Hash::default(),
+                "区块链的创世纪区块的prev_hash必须为0"
+            );
+            assert!(
+                blocks.len() > self.length as usize,
+                "要替换的区块链长度必须大于当前区块链长度"
+            );
 
             std::fs::remove_dir_all(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
             self.db = DB::open_default(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
@@ -112,10 +137,17 @@ impl Blockchain {
         let new_tip = *blocks.last().unwrap().hash();
         let new_length = self.length + blocks.len() as u64;
         for block in blocks {
-            self.db.put(DbKey::Block(block.hash()), bincode::serialize(&block).unwrap()).unwrap();
+            self.db
+                .put(
+                    DbKey::Block(block.hash()),
+                    bincode::serialize(&block).unwrap(),
+                )
+                .unwrap();
         }
         self.db.put(DbKey::Tip, new_tip.as_bytes()).unwrap();
-        self.db.put(DbKey::Length, bincode::serialize(&new_length).unwrap()).unwrap();
+        self.db
+            .put(DbKey::Length, bincode::serialize(&new_length).unwrap())
+            .unwrap();
         self.tip = new_tip;
         self.length = new_length;
     }
@@ -143,6 +175,10 @@ impl Blockchain {
             .unwrap();
         self.db
             .put(DbKey::Tip, new_block.hash().as_bytes())
+            .unwrap();
+        self.length += 1;
+        self.db
+            .put(DbKey::Length, bincode::serialize(&self.length).unwrap())
             .unwrap();
         self.tip = *new_block.hash();
         Ok(new_block)
@@ -172,7 +208,7 @@ impl Blockchain {
     }
 
     /// 验证区块序列是否合法
-    /// 
+    ///
     /// 验证规则:
     /// 1. 每个区块的prev_hash必须等于前一个区块的hash
     /// 2. 每个区块的工作量证明必须有效
@@ -289,12 +325,21 @@ impl Blockchain {
             .vin
             .iter()
             .map(|vin| {
-                (
-                    vin.txid.unwrap(),
-                    self.find_transaction(&vin.txid.unwrap()).unwrap(),
-                )
+                let txid = vin.txid.unwrap();
+                self.find_transaction(&txid).map(|prev_tx| (txid, prev_tx))
             })
+            .collect::<Vec<_>>();
+
+        // 如果有任何一个输入交易找不到，则返回false
+        if prev_txs.iter().any(|tx| tx.is_none()) {
+            return false;
+        }
+
+        let prev_txs = prev_txs
+            .into_iter()
+            .flatten()
             .collect::<HashMap<_, _>>();
+
         tx.verify(&prev_txs)
     }
 }

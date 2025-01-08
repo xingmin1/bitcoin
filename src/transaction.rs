@@ -8,7 +8,7 @@ use crate::{
     block::Hash, utxo_set::UtxoSet, wallet::{self, Wallets}
 };
 
-const COINBASE_AMOUNT: u32 = 50;
+const COINBASE_AMOUNT: u32 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TxOutput {
