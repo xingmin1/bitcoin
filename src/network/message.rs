@@ -2,6 +2,7 @@ use log::warn;
 
 use crate::{
     block::{Block, Hash},
+    blockchain::Blockchain,
     proof_of_work::ProofOfWork,
     transaction::Transaction,
 };
@@ -16,13 +17,12 @@ pub struct Message {
 
 #[derive(Debug, Clone)]
 pub enum MessageData {
-    Block {
+    BlockChain {
         block_chain_length: u64,
-        block: Block,
+        block_chain: Vec<Block>,
     },
     Transaction(Transaction),
     Address(String),
-    GetBlock(Hash),
     GetTransaction(Hash),
 }
 
@@ -43,94 +43,31 @@ impl Message {
     //     获取版本消息 -》 将本线程区块链的版本号发送
     pub fn handle(self, node: &mut Node, from_id: usize) {
         match self.data {
-            MessageData::Block {
+            MessageData::BlockChain {
                 block_chain_length,
-                block,
+                block_chain,
             } => {
-                if node.block_cache_from_id.is_some() && node.block_cache_from_id.unwrap() != from_id {
-                    return;
-                }
-
-                // 验证区块的PoW
-                if !ProofOfWork::new(&block).validate() {
+                if Blockchain::verify_blocks(&block_chain).is_err() {
                     return;
                 }
 
                 let blockchain = match node.utxo_set.as_mut() {
                     Some(utxo_set) => &mut utxo_set.blockchain,
                     None => {
-                        warn!("节点 {} 收到区块消息,但区块链不存在", node.id);
+                        warn!(
+                            "节点 {} 收到区块消息,但区块链不存在，接受到的区块数量：{}",
+                            node.id,
+                            block_chain.len()
+                        );
                         // 如果区块链不存在,直接缓存区块
-                        node.block_cache.push(block.clone());
-                        node.block_cache_from_id = Some(from_id);
-
-                        if block.prev_hash != Hash::default() {
-                            node.send_message_to_one(
-                                from_id,
-                                Message::new(node.id, MessageData::GetBlock(block.prev_hash)),
-                            );
-                            // 等待接收父区块
-                            // TODO: 增加超时机制
-                            while let Ok(message) = node.recv_channel.recv() {
-                                if let MessageData::Block { .. } = message.data {
-                                    message.handle(node, from_id);
-                                    break;
-                                }
-                            }
-                        } else {
-                            warn!("以收到的区块创建区块链");
-                            let block_cache = node.block_cache.clone();
-                            node.update_or_create_blockchain(block_cache);
-                            node.block_cache.clear();
-                            node.block_cache_from_id = None;
-                        }
+                        node.update_or_create_blockchain(block_chain);
                         return;
                     }
                 };
 
-                // 验证区块中的交易
-                for tx in block.transactions() {
-                    // // 验证非铸币交易
-                    // if !tx.is_coinbase() && !blockchain.verify_transaction(tx) {
-                    //     return;
-                    // }
-                    // 若交易已存在于区块链中，则该区块非法
-                    if blockchain.find_transaction(&tx.id).is_some() {
-                        return;
-                    }
-                    // 从交易缓存中移除已确认的交易
-                    node.transaction_cache.retain(|t| t.id != tx.id);
-                }
-
                 // 如果收到的合法区块链更长,则缓存区块
                 if block_chain_length > blockchain.length {
-                    node.block_cache.push(block.clone());
-                    node.block_cache_from_id = Some(from_id);
-                }
-
-                // 判断区块是否可以添加到链上
-                let can_update = block.prev_hash == Hash::default() || blockchain.tip == block.prev_hash;
-                if can_update {
-                    // 更新区块链并清空缓存
-                    node.update_or_create_blockchain(node.block_cache.clone());
-                    node.block_cache.clear();
-                    node.block_cache_from_id = None;
-                } else {
-                    // 请求父区块并等待响应
-                    node.send_message_to_one(
-                        from_id,
-                        Message::new(node.id, MessageData::GetBlock(block.prev_hash)),
-                    );
-
-                    // 等待接收父区块
-                    // TODO: 增加超时机制
-                    while let Ok(message) = node.recv_channel.recv() {
-                        if let MessageData::Block { .. } = message.data {
-                            message.handle(node, from_id);
-                            break;
-                        }
-                        message.handle(node, from_id);
-                    }
+                    node.update_or_create_blockchain(block_chain);
                 }
             }
 
@@ -143,9 +80,14 @@ impl Message {
                 let blockchain = node.blockchain();
 
                 // 检查交易是否已存在或无效
-                if blockchain.is_none() || blockchain.as_ref().unwrap().find_transaction(&transaction.id).is_some() 
+                if blockchain.is_none()
+                    || blockchain
+                        .as_ref()
+                        .unwrap()
+                        .find_transaction(&transaction.id)
+                        .is_some()
                     || !blockchain.unwrap().verify_transaction(&transaction)
-                    || node.transaction_cache.contains(&transaction) 
+                    || node.transaction_cache.contains(&transaction)
                 {
                     return;
                 }
@@ -156,23 +98,6 @@ impl Message {
             MessageData::Address(address) => {
                 // 将地址加入到节点中
                 node.addresses.insert(from_id, address);
-            }
-            MessageData::GetBlock(hash) => {
-                warn!("节点 {} 收到 节点 {} 的获取区块消息", node.id, from_id);
-                // 查找并发送指定哈希值的区块
-                let blockchain = &node.utxo_set.as_ref().unwrap().blockchain;
-                if let Some(block) = blockchain.iter().find(|block| block.hash == hash) {
-                    node.send_message_to_one(
-                        from_id,
-                        Message::new(
-                            node.id,
-                            MessageData::Block {
-                                block_chain_length: blockchain.length,
-                                block: block.clone(),
-                            },
-                        ),
-                    );
-                }
             }
 
             MessageData::GetTransaction(hash) => {

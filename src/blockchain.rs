@@ -5,7 +5,7 @@ use crate::{
     proof_of_work::ProofOfWork,
     transaction::{Transaction, TxOutputs},
 };
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use rocksdb::DB;
 use thiserror::Error;
 
@@ -84,7 +84,7 @@ impl Blockchain {
 
     pub fn create_with_blocks(blocks: Vec<Block>, path_prefix: &str) -> Self {
         let db = DB::open_default(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
-        let tip = *blocks.last().unwrap().hash();
+        let tip = *blocks.first().unwrap().hash();
         db.put(DbKey::Tip, tip.as_bytes()).unwrap();
         db.put(
             DbKey::Length,
@@ -128,13 +128,13 @@ impl Blockchain {
                 "要替换的区块链长度必须大于当前区块链长度"
             );
 
-            std::fs::remove_dir_all(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
-            self.db = DB::open_default(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
+            // std::fs::remove_dir_all(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
+            // self.db = DB::open_default(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
             self.tip = Hash::default();
             self.length = 0;
         }
 
-        let new_tip = *blocks.last().unwrap().hash();
+        let new_tip = *blocks.first().unwrap().hash();
         let new_length = self.length + blocks.len() as u64;
         for block in blocks {
             self.db
@@ -155,6 +155,7 @@ impl Blockchain {
     pub fn mine_block(&mut self, transactions: Vec<Transaction>) -> Result<Block, BlockchainError> {
         for tx in &transactions {
             if !self.verify_transaction(tx) {
+                warn!("mine_block: 交易验证失败，交易id: {:?}", tx.id);
                 return Err(BlockchainError::BlockError(BlockError::InvalidTransaction(
                     tx.clone(),
                 )));
@@ -341,6 +342,16 @@ impl Blockchain {
             .collect::<HashMap<_, _>>();
 
         tx.verify(&prev_txs)
+    }
+
+    /// 将区块链中所有区块的哈希值转换为字符串表示
+    /// 
+    /// 返回一个字符串,每个区块的哈希值用 "\n -> " 连接,从最新的区块开始
+    pub fn to_hashes_string(&self) -> String {
+        self.iter()
+            .map(|block| block.hash().to_string())
+            .collect::<Vec<_>>()
+            .join("\n -> ")
     }
 }
 
