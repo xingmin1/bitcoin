@@ -3,11 +3,12 @@ use clap::{self, Subcommand};
 use clap::{command, Parser};
 mod block;
 mod blockchain;
+mod merkle_tree;
+mod network;
 mod proof_of_work;
 mod transaction;
 mod utxo_set;
 mod wallet;
-mod merkle_tree;
 
 use blockchain::Blockchain;
 use transaction::Transaction;
@@ -64,36 +65,39 @@ enum Commands {
 }
 
 #[derive(Debug)]
-struct BlockchainApp {
-    pub utxo_set: UtxoSet,
+struct BlockchainApp<'a> {
+    pub utxo_set: &'a mut UtxoSet,
 }
 
-impl BlockchainApp {
-    fn new(address: String) -> Result<Self> {
-        let chain = Blockchain::new(address);
-        let utxo_set = UtxoSet::new(chain);
-        utxo_set.reindex();
-        Ok(Self { utxo_set })
+impl<'a> BlockchainApp<'a> {
+    fn new(utxo_set: &'a mut UtxoSet) -> Self {
+        Self { utxo_set }
     }
 
-    fn send(&mut self, from: String, to: String, amount: u32) -> Result<()> {
+    fn send(&mut self, from: String, to: String, amount: u32, path_prefix: &str) -> Result<()> {
         if !(wallet::validate_address(&from) && wallet::validate_address(&to)) {
             return Err(anyhow::anyhow!("Invalid address"));
         }
 
-        let tx = Transaction::new_utxo_transaction(from.clone(), to, amount, &self.utxo_set);
+        let tx = Transaction::new_utxo_transaction(
+            from.clone(),
+            to,
+            amount,
+            &self.utxo_set,
+            path_prefix,
+        );
         let coinbase_tx = Transaction::new_coinbase_tx(from, "".to_string());
         let block = self.utxo_set.blockchain.mine_block(vec![tx, coinbase_tx])?;
-        self.utxo_set.update(&block);
+        self.utxo_set.update(&block, path_prefix);
         Ok(())
     }
 
-    fn get_balance(&self, address: String) -> Result<()> {
+    fn get_balance(&self, address: String, path_prefix: &str) -> Result<()> {
         let decoded = bs58::decode(&address).into_vec().unwrap();
         let pub_key_hash = &decoded[1..decoded.len() - 4];
         let balance = self
             .utxo_set
-            .find_utxo(pub_key_hash)
+            .find_utxo(pub_key_hash, path_prefix)
             .into_iter()
             .map(|output| output.value)
             .sum::<u32>();
@@ -111,15 +115,15 @@ impl BlockchainApp {
         Ok(())
     }
 
-    fn create_wallet() -> String {
-        let mut wallets = wallet::Wallets::new();
+    fn create_wallet(path_prefix: &str) -> String {
+        let mut wallets = wallet::Wallets::new(path_prefix);
         let address = wallets.create_wallet();
-        wallets.save_to_file();
+        wallets.save_to_file(path_prefix);
         address
     }
 
-    fn list_addresses() {
-        let wallets = wallet::Wallets::new();
+    fn list_addresses(path_prefix: &str) {
+        let wallets = wallet::Wallets::new(path_prefix);
         let addresses = wallets.get_addresses();
         for address in addresses {
             println!("{}", address);
@@ -137,56 +141,11 @@ fn main() -> Result<()> {
 
     env_logger::init_from_env(env);
 
-    let cli = Cli::parse();
-
-    match cli.command {
-        Commands::Init { address } => {
-            println!("Initialized new blockchain");
-
-            let app = BlockchainApp::new(address)?;
-            app.list_blocks();
-        }
-
-        Commands::Send { from, to, amount } => {
-            let mut app = BlockchainApp::new(from.clone())?;
-            app.send(from, to, amount)?;
-            app.list_blocks();
-        }
-
-        Commands::GetBalance { address } => {
-            let app = BlockchainApp::new(address.clone())?;
-            app.get_balance(address)?;
-        }
-
-        Commands::PrintChain => {
-            let app = BlockchainApp::new("".to_string())?;
-            app.list_blocks();
-        }
-
-        Commands::Verify => {
-            let app = BlockchainApp::new("".to_string())?;
-            app.verify_chain()?;
-        }
-
-        Commands::CreateWallet => {
-            println!(
-                "New wallet created with address: {}",
-                BlockchainApp::create_wallet()
-            );
-        }
-
-        Commands::ListAddresses => {
-            BlockchainApp::list_addresses();
-        }
-    }
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use log::warn;
-
     use super::*;
     use std::fs;
 
@@ -198,29 +157,42 @@ mod tests {
 
         env_logger::init_from_env(env);
 
-        let _ = fs::remove_file("wallets.dat").inspect_err(|e| {
-            warn!("Failed to remove wallets.dat: {}", e);
-        });
-        let _ = fs::remove_dir_all("blockchain.db").inspect_err(|e| {
-            warn!("Failed to remove blockchain.db: {}", e);
-        });
-        let a = BlockchainApp::create_wallet();
-        let b = BlockchainApp::create_wallet();
-        let c = BlockchainApp::create_wallet();
-        let mut app = BlockchainApp::new(a.clone()).unwrap();
-        app.send(a.clone(), b.clone(), 15).unwrap();
-        app.send(b.clone(), c.clone(), 5).unwrap();
-        app.send(a.clone(), a.clone(), 10).unwrap();
-        app.get_balance(a.clone()).unwrap();
-        app.get_balance(b.clone()).unwrap();
-        app.get_balance(c.clone()).unwrap();
+        // 创建测试目录
+        let _ = std::fs::remove_dir_all("data/test");
+        std::fs::create_dir_all("data/test").unwrap();
+
+        let path_prefix = "data/test";
+        let a = BlockchainApp::create_wallet(path_prefix);
+        let b = BlockchainApp::create_wallet(path_prefix);
+        let c = BlockchainApp::create_wallet(path_prefix);
+
+        // 创建区块链和 UTXO 集合
+        let blockchain = Blockchain::new(a.clone(), path_prefix);
+        let mut utxo_set = UtxoSet::new(blockchain);
+
+        // 手动更新 UTXO 集合，确保包含创世区块的交易
+        utxo_set.reindex(path_prefix);
+
+        let mut app = BlockchainApp::new(&mut utxo_set);
+
+        // 打印初始余额
+        app.get_balance(a.clone(), path_prefix).unwrap();
+        app.get_balance(b.clone(), path_prefix).unwrap();
+        app.get_balance(c.clone(), path_prefix).unwrap();
+
+        app.send(a.clone(), b.clone(), 15, path_prefix).unwrap();
+        app.send(b.clone(), c.clone(), 5, path_prefix).unwrap();
+        app.send(a.clone(), a.clone(), 10, path_prefix).unwrap();
+
+        app.get_balance(a.clone(), path_prefix).unwrap();
+        app.get_balance(b.clone(), path_prefix).unwrap();
+        app.get_balance(c.clone(), path_prefix).unwrap();
 
         app.list_blocks();
         app.verify_chain().unwrap();
 
-        BlockchainApp::list_addresses();
+        BlockchainApp::list_addresses(path_prefix);
 
-        let _ = fs::remove_dir("wallets.dat");
-        let _ = fs::remove_dir("blockchain.db");
+        std::fs::remove_dir_all("data/test").unwrap();
     }
 }

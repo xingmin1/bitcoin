@@ -23,16 +23,17 @@ impl<'a> ProofOfWork<'a> {
         let mut hash;
         let mut hash_int;
 
-        info!("Mining block with data: {:?}", self.block.transactions());
+        info!("开始挖矿...");
+        info!("交易数据: {}", self.block.transactions().iter().map(|tx| tx.to_string()).collect::<Vec<String>>().join("\n"));
         loop {
             hasher.update(self.prepare_data(&nonce));
             hash = hasher.finalize_reset();
             hash_int = BigUint::from_bytes_le(&hash);
             if hash_int < self.target {
                 let hash = Hash::from(&hash);
-                info!("Found hash: {}", hash);
-                info!("Nonce: {}", nonce);
-                info!("\n");
+                info!("挖矿成功!");
+                info!("区块哈希: {}", hash);
+                info!("随机数: {}", nonce);
                 return (nonce, hash);
             }
             nonce += 1u32;

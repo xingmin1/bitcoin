@@ -30,9 +30,9 @@ impl UtxoSet {
     /// 重建UTXO集合
     ///
     /// 扫描整个区块链，重新构建UTXO集合。这个操作会删除现有的UTXO数据库并重新创建。
-    pub fn reindex(&self) {
-        let _ = std::fs::remove_dir_all(UTXO_SET_DB_NAME);
-        let db = DB::open_default(UTXO_SET_DB_NAME).unwrap();
+    pub fn reindex(&self, path_prefix: &str) {
+        let _ = std::fs::remove_dir_all(format!("{}/{}", path_prefix, UTXO_SET_DB_NAME));
+        let db = DB::open_default(format!("{}/{}", path_prefix, UTXO_SET_DB_NAME)).unwrap();
         let utxo_map = self.blockchain.find_utxo();
         for (txid, outputs) in utxo_map {
             let serialized_outputs = bincode::serialize(&outputs).unwrap();
@@ -53,8 +53,9 @@ impl UtxoSet {
         &self,
         pub_key_hash: &[u8],
         amount: u32,
+        path_prefix: &str,
     ) -> (u32, HashMap<Hash, Vec<i32>>) {
-        let db = DB::open_default(UTXO_SET_DB_NAME).unwrap();
+        let db = DB::open_default(format!("{}/{}", path_prefix, UTXO_SET_DB_NAME)).unwrap();
         let mut unspent_outputs = HashMap::new();
         let mut accumulated = 0;
 
@@ -78,8 +79,8 @@ impl UtxoSet {
     }
 
     /// 查找地址的所有未花费输出
-    pub fn find_utxo(&self, pub_key_hash: &[u8]) -> Vec<TxOutput> {
-        let db = DB::open_default(UTXO_SET_DB_NAME).unwrap();
+    pub fn find_utxo(&self, pub_key_hash: &[u8], path_prefix: &str) -> Vec<TxOutput> {
+        let db = DB::open_default(format!("{}/{}", path_prefix, UTXO_SET_DB_NAME)).unwrap();
         let mut utxos = Vec::new();
         let iter = db.iterator(rocksdb::IteratorMode::Start);
 
@@ -102,8 +103,8 @@ impl UtxoSet {
     /// 处理新区块中的所有交易：
     /// 1. 删除已花费的输出
     /// 2. 添加新的未花费输出
-    pub fn update(&self, block: &Block) {
-        let db = DB::open_default(UTXO_SET_DB_NAME).unwrap();
+    pub fn update(&self, block: &Block, path_prefix: &str) {
+        let db = DB::open_default(format!("{}/{}", path_prefix, UTXO_SET_DB_NAME)).unwrap();
 
         // 处理交易输入，删除已花费的输出
         block

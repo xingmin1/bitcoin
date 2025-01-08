@@ -62,11 +62,11 @@ impl std::fmt::Display for Hash {
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 // 所有字段都认为是小端序
 pub struct Block {
-    timestamp: i64,
-    transactions: Vec<Transaction>,
-    prev_hash: Hash,
-    hash: Hash,
-    nonce: BigUint,
+    pub timestamp: i64,
+    pub transactions: Vec<Transaction>,
+    pub prev_hash: Hash,
+    pub hash: Hash,
+    pub nonce: BigUint,
 }
 
 impl Block {

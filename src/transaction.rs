@@ -10,20 +10,20 @@ use crate::{
 
 const COINBASE_AMOUNT: u32 = 50;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TxOutput {
     pub value: u32,
     pub pub_key_hash: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TxOutputs {
     pub outputs: Vec<TxOutput>,
     /// 输出所在的索引
     pub out_idxs: Vec<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TxInput {
     pub txid: Option<Hash>,
     pub vout: Option<i32>,
@@ -31,7 +31,7 @@ pub struct TxInput {
     pub pub_key: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Transaction {
     pub id: Hash,
     pub vin: Vec<TxInput>,
@@ -182,16 +182,16 @@ impl Transaction {
         self.vin.len() == 1 && self.vin[0].txid.is_none() && self.vin[0].vout.is_none()
     }
 
-    pub fn new_utxo_transaction(from: String, to: String, amount: u32, utxo_set: &UtxoSet) -> Self {
+    pub fn new_utxo_transaction(from: String, to: String, amount: u32, utxo_set: &UtxoSet, path_prefix: &str) -> Self {
         let mut inputs = vec![];
         let mut outputs = vec![];
 
-        let wallets = Wallets::new();
+        let wallets = Wallets::new(path_prefix);
         let wallet = wallets.get_wallet(&from).unwrap();
         let pub_key_hash = wallet::hash_pub_key(&wallet.public_key);
         trace!("new_utxo_transaction pub_key_hash: {:?}", pub_key_hash);
 
-        let (acc, valid_outputs) = utxo_set.find_spendable_outputs(&pub_key_hash, amount);
+        let (acc, valid_outputs) = utxo_set.find_spendable_outputs(&pub_key_hash, amount, path_prefix);
         if acc < amount {
             panic!("ERROR: Not enough funds");
         }
@@ -254,20 +254,20 @@ impl TxOutput {
 
 impl Display for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut lines = vec![format!("--- Transaction {}:", self.id)];
+        let mut lines = vec![format!("Transaction: {}", self.id)];
 
         for (i, input) in self.vin.iter().enumerate() {
-            lines.push(format!("     Input {}:", i));
-            lines.push(format!("       TXID:      {:?}", input.txid));
-            lines.push(format!("       Out:       {:?}", input.vout));
-            lines.push(format!("       Signature: {:?}", input.signature));
-            lines.push(format!("       PubKey:    {:?}", input.pub_key));
+            lines.push(format!("Input[{}]", i));
+            lines.push(format!("  ├─ TXID: {}", input.txid.as_ref().map_or("None".into(), |h| h.to_string())));
+            lines.push(format!("  ├─ Out: {}", input.vout.map_or("None".into(), |v| v.to_string())));
+            lines.push(format!("  ├─ Signature: {:x?}", input.signature));
+            lines.push(format!("  └─ PubKey: {:x?}", input.pub_key));
         }
 
         for (i, output) in self.vout.iter().enumerate() {
-            lines.push(format!("     Output {}:", i));
-            lines.push(format!("       Value:  {:?}", output.value));
-            lines.push(format!("       Script: {:?}", output.pub_key_hash));
+            lines.push(format!("Output[{}]", i));
+            lines.push(format!("  ├─ Value: {}", output.value));
+            lines.push(format!("  └─ Script: {:x?}", output.pub_key_hash));
         }
 
         write!(f, "{}", lines.join("\n"))

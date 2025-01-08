@@ -5,7 +5,7 @@ use crate::{
     proof_of_work::ProofOfWork,
     transaction::{Transaction, TxOutputs},
 };
-use log::trace;
+use log::{debug, trace};
 use rocksdb::DB;
 use thiserror::Error;
 
@@ -13,13 +13,15 @@ const DB_PATH: &str = "blockchain.db";
 
 pub enum DbKey<'a> {
     Tip,
+    Length,
     Block(&'a Hash),
 }
 
 impl<'a> AsRef<[u8]> for DbKey<'a> {
     fn as_ref(&self) -> &[u8] {
         match self {
-            DbKey::Tip => b"l",
+            DbKey::Tip => b"tip",
+            DbKey::Length => b"length",
             DbKey::Block(hash) => hash.as_bytes(),
         }
     }
@@ -40,27 +42,82 @@ pub enum BlockchainError {
 #[derive(Debug)]
 pub struct Blockchain {
     db: DB,
-    tip: Hash,
+    pub tip: Hash,
+    pub length: u64,
 }
 
 impl Blockchain {
-    pub fn new(genesis_address: String) -> Self {
-        let db = DB::open_default(DB_PATH).unwrap();
+    pub fn new(genesis_address: String, path_prefix: &str) -> Self {
+        let db = DB::open_default(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
 
         if let Ok(Some(tip)) = db.get(DbKey::Tip) {
+            let length = db.get(DbKey::Length).unwrap().unwrap();
             Self {
                 db,
                 tip: Hash::from(tip.as_slice()),
+                length: bincode::deserialize(&length).unwrap(),
             }
         } else {
+            debug!("create genesis block");
+
             let genesis_tx = Transaction::new_coinbase_tx(genesis_address, "".to_string());
             let genesis = Block::genesis(genesis_tx).unwrap();
             let tip = genesis.hash();
             db.put(DbKey::Block(tip), bincode::serialize(&genesis).unwrap())
                 .unwrap();
             db.put(DbKey::Tip, tip.as_bytes()).unwrap();
-            Self { db, tip: *tip }
+            db.put(DbKey::Length, bincode::serialize(&1).unwrap()).unwrap();
+            Self { db, tip: *tip, length: 1 }
         }
+    }
+
+    pub fn create_with_blocks(blocks: Vec<Block>, path_prefix: &str) -> Self {
+        let db = DB::open_default(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
+        let tip = *blocks.last().unwrap().hash();
+        db.put(DbKey::Tip, tip.as_bytes()).unwrap();
+        db.put(DbKey::Length, bincode::serialize(&(blocks.len() as u64)).unwrap()).unwrap();
+        let length = blocks.len() as u64;
+        for block in blocks {
+            db.put(DbKey::Block(block.hash()), bincode::serialize(&block).unwrap()).unwrap();
+        }
+        Self { db, tip, length }
+    }
+
+    /// 更新区块链，传入的区块集合必须合法
+    /// 
+    /// 更新规则:
+    /// 1. 如果传入的区块集合为空，则不更新
+    /// 2. 如果传入的区块集合不合法，则不更新
+    /// 3. 如果传入的区块集合的最后一个区块的prev_hash不等于当前区块链的tip，则视为新区块链，替换当前区块链
+    /// 4. 如果传入的区块集合的最后一个区块的prev_hash等于当前区块链的tip，则视为在当前区块链基础上追加新区块
+    pub fn update(&mut self, blocks: Vec<Block>, path_prefix: &str) {
+        if blocks.is_empty() {
+            return;
+        }
+        if Self::verify_blocks(&blocks).is_err() {
+            return;
+        }
+        
+        if blocks.last().unwrap().prev_hash != self.tip {
+            assert_eq!(blocks.last().unwrap().prev_hash, Hash::default(), "区块链的创世纪区块的prev_hash必须为0");
+            assert!(blocks.len() > self.length as usize, "要替换的区块链长度必须大于当前区块链长度");
+            
+
+            std::fs::remove_dir_all(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
+            self.db = DB::open_default(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
+            self.tip = Hash::default();
+            self.length = 0;
+        }
+
+        let new_tip = *blocks.last().unwrap().hash();
+        let new_length = self.length + blocks.len() as u64;
+        for block in blocks {
+            self.db.put(DbKey::Block(block.hash()), bincode::serialize(&block).unwrap()).unwrap();
+        }
+        self.db.put(DbKey::Tip, new_tip.as_bytes()).unwrap();
+        self.db.put(DbKey::Length, bincode::serialize(&new_length).unwrap()).unwrap();
+        self.tip = new_tip;
+        self.length = new_length;
     }
 
     pub fn mine_block(&mut self, transactions: Vec<Transaction>) -> Result<Block, BlockchainError> {
@@ -108,15 +165,27 @@ impl Blockchain {
     }
 
     #[allow(dead_code)]
+    /// 验证区块链是否合法
     pub fn verify_chain(&self) -> Result<(), BlockchainError> {
-        let blocks: Vec<Block> = self
+        let blocks: Vec<Block> = self.iter().collect();
+        Self::verify_blocks(&blocks)
+    }
+
+    /// 验证区块序列是否合法
+    /// 
+    /// 验证规则:
+    /// 1. 每个区块的prev_hash必须等于前一个区块的hash
+    /// 2. 每个区块的工作量证明必须有效
+    pub fn verify_blocks(blocks: &[Block]) -> Result<(), BlockchainError> {
+        // 添加一个默认区块用于验证创世区块
+        let blocks_with_default: Vec<Block> = blocks
             .iter()
-            // 为了验证创世区块，需要加入一个默认的区块
+            .cloned()
             .chain(std::iter::once(Block::default()))
             .collect();
 
         // 先遍历到的是最新的区块
-        for window in blocks.windows(2) {
+        for window in blocks_with_default.windows(2) {
             let current_block = &window[0];
             let prev_block = &window[1];
 
