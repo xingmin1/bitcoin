@@ -1,9 +1,8 @@
-use log::warn;
+use log::{debug, info};
 
 use crate::{
-    block::{Block, Hash},
+    block::Block,
     blockchain::Blockchain,
-    proof_of_work::ProofOfWork,
     transaction::Transaction,
 };
 
@@ -23,7 +22,6 @@ pub enum MessageData {
     },
     Transaction(Transaction),
     Address(String),
-    GetTransaction(Hash),
 }
 
 impl Message {
@@ -54,7 +52,7 @@ impl Message {
                 let blockchain = match node.utxo_set.as_mut() {
                     Some(utxo_set) => &mut utxo_set.blockchain,
                     None => {
-                        warn!(
+                        info!(target: "chain",
                             "节点 {} 收到区块消息,但区块链不存在，接受到的区块数量：{}",
                             node.id,
                             block_chain.len()
@@ -67,6 +65,10 @@ impl Message {
 
                 // 如果收到的合法区块链更长,则缓存区块
                 if block_chain_length > blockchain.length {
+                    debug!(target: "chain",
+                        "节点 {} 收到更长的区块链，长度：{}，当前长度：{}",
+                        node.id, block_chain_length, blockchain.length
+                    );
                     node.update_or_create_blockchain(block_chain);
                 }
             }
@@ -78,14 +80,17 @@ impl Message {
                 }
 
                 let blockchain = node.blockchain();
+                if blockchain.is_none() {
+                    debug!(target: "chain", "节点 {} 收到交易消息，但区块链不存在", node.id);
+                    return;
+                }
 
                 // 检查交易是否已存在或无效
-                if blockchain.is_none()
-                    || blockchain
-                        .as_ref()
-                        .unwrap()
-                        .find_transaction(&transaction.id)
-                        .is_some()
+                if blockchain
+                    .as_ref()
+                    .unwrap()
+                    .find_transaction(&transaction.id)
+                    .is_some()
                     || !blockchain.unwrap().verify_transaction(&transaction)
                     || node.transaction_cache.contains(&transaction)
                 {
@@ -98,16 +103,6 @@ impl Message {
             MessageData::Address(address) => {
                 // 将地址加入到节点中
                 node.addresses.insert(from_id, address);
-            }
-
-            MessageData::GetTransaction(hash) => {
-                // 查找并发送指定哈希值的交易
-                if let Some(transaction) = node.transaction_cache.iter().find(|tx| tx.id == hash) {
-                    node.send_message_to_one(
-                        from_id,
-                        Message::new(node.id, MessageData::Transaction(transaction.clone())),
-                    );
-                }
             }
         }
     }

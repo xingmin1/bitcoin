@@ -1,13 +1,13 @@
-use log::warn;
+use log::{debug, info};
 
 use crate::{
-    block::Block,
-    blockchain::Blockchain,
-    transaction::Transaction,
-    utxo_set::UtxoSet,
+    block::Block, blockchain::Blockchain, transaction::Transaction, utxo_set::UtxoSet,
     wallet::Wallets,
 };
-use std::{collections::HashMap, sync::mpsc::{channel, Receiver, Sender}};
+use std::{
+    collections::HashMap,
+    sync::mpsc::{channel, Receiver, Sender},
+};
 
 use super::message::{Message, MessageData};
 
@@ -55,31 +55,27 @@ impl Node {
         match &mut self.utxo_set {
             None => {
                 // 如果 UTXO 集合不存在，创建新的区块链和 UTXO 集合
-                warn!("节点 {} 创建区块链，区块数量：{}", self.id, blocks.len());
+                info!(target: "chain", "节点 {} 创建区块链，区块数量：{}", self.id, blocks.len());
                 let blockchain = Blockchain::create_with_blocks(blocks, &path);
                 self.utxo_set = Some(UtxoSet::new(blockchain));
             }
             Some(utxo_set) => {
                 // 如果 UTXO 集合存在，更新区块链
-                utxo_set.blockchain.update(blocks, &path);
+                debug!(target: "chain", "节点 {} 更新区块链，区块数量：{}", self.id, blocks.len());
+                utxo_set.blockchain.update(blocks);
             }
         }
         self.utxo_set.as_mut().unwrap().reindex(&path);
         self.transaction_cache.retain(|tx| {
             let blockchain = &self.utxo_set.as_mut().unwrap().blockchain;
-            blockchain.find_transaction(&tx.id).is_none() && blockchain.verify_transaction(&tx)
+            blockchain.find_transaction(&tx.id).is_none() && blockchain.verify_transaction(tx)
         });
     }
 
     pub fn send_message_to_all(&self, message: Message) {
-        self.send_channels
-            .iter()
-            .for_each(|channel| { let _ = channel.send(message.clone()); });
-    }
-
-    pub fn send_message_to_one(&self, node_id: usize, message: Message) {
-        let channel = &self.send_channels[node_id];
-        let _ = channel.send(message);
+        self.send_channels.iter().for_each(|channel| {
+            let _ = channel.send(message.clone());
+        });
     }
 
     pub fn path_prefix(node_id: usize) -> String {
@@ -88,7 +84,6 @@ impl Node {
 
     /// 创建指定数量的节点
     pub fn create_nodes(node_count: usize) -> Vec<Self> {
-
         // 清理创建data目录
         (0..node_count).for_each(|i| {
             let data_dir = Node::path_prefix(i);
@@ -97,9 +92,8 @@ impl Node {
         });
 
         // 创建通信通道
-        let (send_channels, recv_channels): (Vec<_>, Vec<_>) = (0..node_count)
-            .map(|_| channel::<Message>())
-            .unzip();
+        let (send_channels, recv_channels): (Vec<_>, Vec<_>) =
+            (0..node_count).map(|_| channel::<Message>()).unzip();
 
         // 创建节点
         recv_channels
@@ -112,34 +106,57 @@ impl Node {
     /// 转账
     pub fn send(&mut self, to_id: usize, amount: u32) {
         let address = self.addresses.get(&to_id).unwrap();
-        let tx = Transaction::new_utxo_transaction(self.wallets.get_addresses()[0].clone(), address.clone(), amount, self.utxo_set.as_ref().unwrap(), &Node::path_prefix(self.id));
+        let tx = Transaction::new_utxo_transaction(
+            self.wallets.get_addresses()[0].clone(),
+            address.clone(),
+            amount,
+            self.utxo_set.as_ref().unwrap(),
+            &Node::path_prefix(self.id),
+        );
         self.transaction_cache.push(tx.clone());
         self.send_message_to_all(Message::new(self.id, MessageData::Transaction(tx)));
     }
 
     /// 挖矿
     pub fn mine(&mut self) {
-        let _block = self.utxo_set.as_mut().unwrap().blockchain.mine_block(self.transaction_cache.clone()).unwrap();
+        let _block = self
+            .utxo_set
+            .as_mut()
+            .unwrap()
+            .blockchain
+            .mine_block(self.transaction_cache.clone())
+            .unwrap();
         self.transaction_cache.clear();
         let length = self.utxo_set.as_mut().unwrap().blockchain.length;
         let block_chain: Vec<Block> = self.utxo_set.as_mut().unwrap().blockchain.iter().collect();
-        warn!("节点 {} 挖矿成功，区块数量：{}，block_chain长度：{}", self.id, length, block_chain.len());
-        self.send_message_to_all(Message::new(self.id, MessageData::BlockChain {
-            block_chain_length: length,
-            block_chain,
-        }));
+        info!(
+            target: "chain",
+            "节点 {} 挖矿成功，区块数量：{}，block_chain长度：{}",
+            self.id,
+            length,
+            block_chain.len()
+        );
+        self.send_message_to_all(Message::new(
+            self.id,
+            MessageData::BlockChain {
+                block_chain_length: length,
+                block_chain,
+            },
+        ));
     }
 
     pub fn send_address_to_all(&self) {
-        self.send_message_to_all(Message::new(self.id, MessageData::Address(self.wallets.get_addresses()[0].clone())));
+        self.send_message_to_all(Message::new(
+            self.id,
+            MessageData::Address(self.wallets.get_addresses()[0].clone()),
+        ));
     }
 
     /// 整理交易缓存，使交易缓存中的交易符合区块链中的交易
     pub fn clean_invalid_transaction(&mut self) {
         self.transaction_cache.retain(|tx| {
             let blockchain = &self.utxo_set.as_mut().unwrap().blockchain;
-            blockchain.find_transaction(&tx.id).is_none() && blockchain.verify_transaction(&tx)
+            blockchain.find_transaction(&tx.id).is_none() && blockchain.verify_transaction(tx)
         });
     }
 }
-

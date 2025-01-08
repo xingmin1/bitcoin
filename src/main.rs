@@ -1,6 +1,6 @@
 use anyhow::Result;
 use blockchain::Blockchain;
-use log::{debug, info, warn};
+use log::{debug, info};
 use network::{Message, MessageData, Node};
 use secp256k1::rand::{self, Rng};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,6 +11,7 @@ use utxo_set::UtxoSet;
 mod block;
 mod blockchain;
 mod cli;
+mod logger;
 mod merkle_tree;
 mod network;
 mod proof_of_work;
@@ -33,24 +34,16 @@ const MAX_TRANSACTION_AMOUNT: u32 = 3; // 最大转账金额
 static FINISHED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn main() -> Result<()> {
-    init_logger();
-    info!("比特币节点模拟程序启动");
+    logger::init();
+    info!(target: "chain", "比特币节点模拟程序启动");
 
     let nodes = Node::create_nodes(NODE_COUNT);
-    info!("创建了 {} 个节点", nodes.len());
+    info!(target: "chain", "创建了 {} 个节点", nodes.len());
 
     let final_nodes = run_node_tasks(nodes)?;
     print_final_state(&final_nodes);
 
     Ok(())
-}
-
-/// 初始化日志系统
-fn init_logger() {
-    let env = env_logger::Env::default()
-        .filter_or("LOG_LEVEL", "warn")
-        .write_style_or("LOG_STYLE", "always");
-    env_logger::init_from_env(env);
 }
 
 /// 运行所有节点的任务
@@ -82,23 +75,23 @@ fn run_node_tasks(nodes: Vec<Node>) -> Result<Vec<Node>> {
 
 /// 打印最终的区块链状态
 fn print_final_state(nodes: &[Node]) {
-    warn!("=== 最终区块链状态 ===");
+    info!(target: "chain", "=== 最终区块链状态 ===");
     for node in nodes {
         if let Some(utxo_set) = &node.utxo_set {
             let blockchain = &utxo_set.blockchain;
-            warn!("节点 {}: ", node.id);
-            warn!("  区块链长度: {}", blockchain.length);
-            warn!("  最新区块哈希: {}", blockchain.tip);
-            warn!("  区块链为 \n{}", blockchain.to_hashes_string());
-            warn!("  账户地址: {}", node.wallets.get_addresses()[0]);
+            info!(target: "chain", "节点 {}: ", node.id);
+            info!(target: "chain", "  区块链长度: {}", blockchain.length);
+            info!(target: "chain", "  最新区块哈希: {}", blockchain.tip);
+            info!(target: "chain", "  区块链为 \n{}", blockchain.to_hashes_string());
+            info!(target: "chain", "  账户地址: {}", node.wallets.get_addresses()[0]);
         }
     }
-    warn!("所有节点任务完成");
+    info!(target: "chain", "所有节点任务完成");
 }
 
 /// 运行单个节点的任务
 fn run_single_node(mut node: Node) -> Result<Node> {
-    info!("节点 {} 开始运行", node.id);
+    info!(target: "chain", "节点 {} 开始运行", node.id);
     node.send_address_to_all();
     random_sleep(INITIAL_WAIT_TIME);
 
@@ -107,7 +100,7 @@ fn run_single_node(mut node: Node) -> Result<Node> {
     }
 
     FINISHED_COUNT.fetch_add(1, Ordering::SeqCst);
-    info!("节点 {} 完成所有任务", node.id);
+    info!(target: "chain", "节点 {} 完成所有任务", node.id);
     wait_for_other_nodes(&mut node);
 
     Ok(node)
@@ -115,11 +108,11 @@ fn run_single_node(mut node: Node) -> Result<Node> {
 
 /// 处理单轮挖矿任务
 fn process_mining_round(node: &mut Node, round: usize) -> Result<()> {
-    debug!("节点 {} 开始第 {} 轮任务", node.id, round + 1);
+    debug!(target: "mining", "节点 {} 开始第 {} 轮任务", node.id, round + 1);
     wait_for_message(node);
 
     initialize_blockchain_if_needed(node);
-    wait_for_addresses(node);
+    wait_for_addresses_if_needed(node);
     process_transactions(node, round);
 
     if try_collect_transactions(node) {
@@ -132,7 +125,7 @@ fn process_mining_round(node: &mut Node, round: usize) -> Result<()> {
 /// 如果需要，初始化区块链
 fn initialize_blockchain_if_needed(node: &mut Node) {
     if node.utxo_set.is_none() {
-        info!("节点 {} 创建新的区块链", node.id);
+        info!(target: "chain", "节点 {} 创建新的区块链", node.id);
         let (blockchain, genesis) = Blockchain::new(
             node.wallets.get_addresses()[0].clone(),
             &Node::path_prefix(node.id),
@@ -142,7 +135,7 @@ fn initialize_blockchain_if_needed(node: &mut Node) {
         node.utxo_set = Some(utxo_set);
 
         if let Some(genesis) = genesis {
-            debug!("节点 {} 发送创世区块给所有节点", node.id);
+            debug!(target: "network", "节点 {} 发送创世区块给所有节点", node.id);
             node.send_message_to_all(Message::new(
                 node.id,
                 MessageData::BlockChain {
@@ -155,7 +148,7 @@ fn initialize_blockchain_if_needed(node: &mut Node) {
 }
 
 /// 等待地址列表非空
-fn wait_for_addresses(node: &mut Node) {
+fn wait_for_addresses_if_needed(node: &mut Node) {
     while node.addresses.is_empty() {
         wait_for_message(node);
     }
@@ -167,7 +160,7 @@ fn process_transactions(node: &mut Node, round: usize) {
         if let Some(amount) = generate_random_transaction_amount() {
             if let Some(to_id) = select_random_recipient(node) {
                 if check_balance(node, amount) {
-                    debug!("节点 {} 向节点 {} 转账 {} 个币", node.id, to_id, amount);
+                    debug!(target: "chain", "节点 {} 向节点 {} 转账 {} 个币", node.id, to_id, amount);
                     node.send(to_id, amount);
                 }
             }
@@ -222,9 +215,9 @@ fn try_collect_transactions(node: &mut Node) -> bool {
 
 /// 挖掘新区块
 fn mine_block(node: &mut Node) {
-    info!("节点 {} 开始挖矿", node.id);
+    info!(target: "mining", "节点 {} 开始挖矿", node.id);
     node.mine();
-    info!("节点 {} 完成挖矿", node.id);
+    info!(target: "mining", "节点 {} 完成挖矿", node.id);
 }
 
 /// 随机休眠一段时间
@@ -244,7 +237,7 @@ fn wait_for_message(node: &mut Node) {
             .recv_timeout(duration.saturating_sub(start_time.elapsed()))
         {
             let from_id = message.from_id;
-            debug!("节点 {} 收到来自节点 {} 的消息", node.id, from_id);
+            debug!(target: "network", "节点 {} 收到来自节点 {} 的消息", node.id, from_id);
             message.handle(node, from_id);
         }
     }
@@ -258,10 +251,7 @@ fn wait_for_other_nodes(node: &mut Node) {
             .recv_timeout(Duration::from_millis(MESSAGE_HANDLE_TIMEOUT))
         {
             let from_id = message.from_id;
-            warn!(
-                "wait_for_handle: 节点 {} 收到来自节点 {} 的消息",
-                node.id, from_id
-            );
+            debug!(target: "network", "节点 {} 收到来自节点 {} 的消息", node.id, from_id);
             message.handle(node, from_id);
         }
     }

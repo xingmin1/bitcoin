@@ -109,7 +109,7 @@ impl Blockchain {
     /// 2. 如果传入的区块集合不合法，则不更新
     /// 3. 如果传入的区块集合的最后一个区块的prev_hash不等于当前区块链的tip，则视为新区块链，替换当前区块链
     /// 4. 如果传入的区块集合的最后一个区块的prev_hash等于当前区块链的tip，则视为在当前区块链基础上追加新区块
-    pub fn update(&mut self, blocks: Vec<Block>, path_prefix: &str) {
+    pub fn update(&mut self, blocks: Vec<Block>) {
         if blocks.is_empty() {
             return;
         }
@@ -128,8 +128,12 @@ impl Blockchain {
                 "要替换的区块链长度必须大于当前区块链长度"
             );
 
-            // std::fs::remove_dir_all(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
-            // self.db = DB::open_default(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
+            let mut batch = rocksdb::WriteBatch::default();
+            for item in self.db.iterator(rocksdb::IteratorMode::Start) {
+                let (key, _) = item.unwrap();
+                batch.delete(key);
+            }
+            self.db.write(batch).unwrap();
             self.tip = Hash::default();
             self.length = 0;
         }
@@ -336,16 +340,13 @@ impl Blockchain {
             return false;
         }
 
-        let prev_txs = prev_txs
-            .into_iter()
-            .flatten()
-            .collect::<HashMap<_, _>>();
+        let prev_txs = prev_txs.into_iter().flatten().collect::<HashMap<_, _>>();
 
         tx.verify(&prev_txs)
     }
 
     /// 将区块链中所有区块的哈希值转换为字符串表示
-    /// 
+    ///
     /// 返回一个字符串,每个区块的哈希值用 "\n -> " 连接,从最新的区块开始
     pub fn to_hashes_string(&self) -> String {
         self.iter()
