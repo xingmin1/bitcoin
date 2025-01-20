@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use log::debug;
+use log::{debug, error, info};
 use rocksdb::DB;
 
 use crate::{
@@ -38,6 +38,7 @@ impl UtxoSet {
             let serialized_outputs = bincode::serialize(&outputs).unwrap();
             db.put(txid.as_bytes(), serialized_outputs).unwrap();
         }
+        db.flush().unwrap();
         debug!("reindex utxo set success");
     }
 
@@ -54,17 +55,21 @@ impl UtxoSet {
         pub_key_hash: &[u8],
         amount: u32,
         path_prefix: &str,
+        given_utxo_set: Option<HashMap<Hash, TxOutputs>>,
     ) -> (u32, HashMap<Hash, Vec<i32>>) {
-        let db = DB::open_default(format!("{}/{}", path_prefix, UTXO_SET_DB_NAME)).unwrap();
+        let utxo_set: HashMap<Hash, TxOutputs> = given_utxo_set.unwrap_or_else(|| {
+            let db = DB::open_default(format!("{}/{}", path_prefix, UTXO_SET_DB_NAME)).unwrap();
+            db.iterator(rocksdb::IteratorMode::Start).map(|item| {
+                let (k, v) = item.unwrap();
+                let txid = Hash::from(&*k);
+                let outputs: TxOutputs = bincode::deserialize(&v).unwrap();
+                (txid, outputs)
+            }).collect()
+        });
         let mut unspent_outputs = HashMap::new();
         let mut accumulated = 0;
 
-        let iter = db.iterator(rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (k, v) = item.unwrap();
-            let txid = Hash::from(&*k);
-            let outputs: TxOutputs = bincode::deserialize(&v).unwrap();
-
+        for (txid, outputs) in utxo_set {
             for (out_id, output) in outputs.outputs.iter().enumerate() {
                 if output.is_locked_with_key(pub_key_hash) && accumulated < amount {
                     accumulated += output.value;
@@ -79,14 +84,18 @@ impl UtxoSet {
     }
 
     /// 查找地址的所有未花费输出
-    pub fn find_utxo(&self, pub_key_hash: &[u8], path_prefix: &str) -> Vec<TxOutput> {
-        let db = DB::open_default(format!("{}/{}", path_prefix, UTXO_SET_DB_NAME)).unwrap();
+    pub fn find_utxo(&self, pub_key_hash: &[u8], path_prefix: &str, given_utxo_set: Option<HashMap<Hash, TxOutputs>>) -> Vec<TxOutput> {
+        let utxo_set: HashMap<Hash, TxOutputs> = given_utxo_set.unwrap_or_else(|| {
+            let db = DB::open_default(format!("{}/{}", path_prefix, UTXO_SET_DB_NAME)).unwrap();
+            db.iterator(rocksdb::IteratorMode::Start).map(|item| {
+                let (k, v) = item.unwrap();
+                let txid = Hash::from(&*k);
+                let outputs: TxOutputs = bincode::deserialize(&v).unwrap();
+                (txid, outputs)
+            }).collect()
+        });
         let mut utxos = Vec::new();
-        let iter = db.iterator(rocksdb::IteratorMode::Start);
-
-        for item in iter {
-            let (_, v) = item.unwrap();
-            let outputs: TxOutputs = bincode::deserialize(&v).unwrap();
+        for (_, outputs) in utxo_set {
             utxos.extend(
                 outputs
                     .outputs
@@ -98,10 +107,22 @@ impl UtxoSet {
         utxos
     }
 
-    pub fn get_balance(&self, address: &str, path_prefix: &str) -> u32 {
+    pub fn get_utxo_set(&self, path_prefix: &str) -> HashMap<Hash, TxOutputs> {
+        let db = DB::open_default(format!("{}/{}", path_prefix, UTXO_SET_DB_NAME)).unwrap();
+        db.iterator(rocksdb::IteratorMode::Start).map(|item| {
+            let (k, v) = item.unwrap();
+            let txid = Hash::from(&*k);
+            let outputs: TxOutputs = bincode::deserialize(&v).unwrap();
+            (txid, outputs)
+        }).collect()
+    }
+
+
+    pub fn get_balance(&self, address: &str, path_prefix: &str, given_utxo_set: Option<HashMap<Hash, TxOutputs>>) -> u32 {
         let decoded = bs58::decode(address).into_vec().unwrap();
         let pub_key_hash = &decoded[1..decoded.len() - 4];
-        let utxos = self.find_utxo(pub_key_hash, path_prefix);
+        let utxos = self.find_utxo(pub_key_hash, path_prefix, given_utxo_set);
+        info!(target: "chain", "utxos: {:?}", utxos);
         utxos.iter().map(|output| output.value).sum()
     }
 
@@ -122,9 +143,12 @@ impl UtxoSet {
             .for_each(|input| {
                 let txid = input.txid.unwrap();
                 let out_idx = input.vout.unwrap();
+                debug!("txid: {}", txid);
                 let mut outputs: TxOutputs =
-                    bincode::deserialize(&db.get(txid.as_bytes()).unwrap().unwrap()).unwrap();
+                    bincode::deserialize(&db.get(txid.as_bytes()).expect("get utxo set db failed").unwrap()).unwrap();
+                let out_idx = outputs.out_idxs.iter().position(|&idx| idx == out_idx).unwrap();
                 outputs.outputs.remove(out_idx as usize);
+                outputs.out_idxs.remove(out_idx as usize);
                 if outputs.outputs.is_empty() {
                     db.delete(txid.as_bytes()).unwrap();
                 } else {
@@ -142,6 +166,8 @@ impl UtxoSet {
             let serialized_outputs = bincode::serialize(&outputs).unwrap();
             db.put(tx.id.as_bytes(), serialized_outputs).unwrap();
         });
+        db.flush().unwrap();
         debug!("update utxo set success");
     }
 }
+

@@ -61,12 +61,17 @@ impl std::fmt::Display for Hash {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 // 所有字段都认为是小端序
-pub struct Block {
+pub struct BlockHeader {
     pub timestamp: i64,
-    pub transactions: Vec<Transaction>,
     pub prev_hash: Hash,
     pub hash: Hash,
     pub nonce: BigUint,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct Block {
+    pub header: BlockHeader,
+    pub transactions: Vec<Transaction>,
 }
 
 impl Block {
@@ -74,15 +79,17 @@ impl Block {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
         let mut block = Self {
-            timestamp,
+            header: BlockHeader {
+                timestamp,
+                prev_hash,
+                hash: Hash::default(),
+                nonce: BigUint::default(),
+            },
             transactions,
-            prev_hash,
-            hash: Hash::default(),
-            nonce: BigUint::default(),
         };
         let (nonce, hash) = ProofOfWork::new(&block).run();
-        block.nonce = nonce;
-        block.hash = hash;
+        block.header.nonce = nonce;
+        block.header.hash = hash;
 
         Ok(block)
     }
@@ -92,16 +99,16 @@ impl Block {
     }
 
     pub fn hash(&self) -> &Hash {
-        &self.hash
+        &self.header.hash
     }
 
     pub fn prev_hash(&self) -> &Hash {
-        &self.prev_hash
+        &self.header.prev_hash
     }
 
     #[allow(dead_code)]
     pub fn timestamp(&self) -> i64 {
-        self.timestamp
+        self.header.timestamp
     }
 
     #[allow(dead_code)]
@@ -118,14 +125,14 @@ impl Block {
 
     #[allow(dead_code)]
     pub fn nonce(&self) -> &BigUint {
-        &self.nonce
+        &self.header.nonce
     }
 }
 
 impl std::fmt::Display for Block {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "============ Block {} ============", self.hash)?;
-        writeln!(f, "Prev. block: {}", self.prev_hash)?;
+        writeln!(f, "============ Block {} ============", self.hash())?;
+        writeln!(f, "Prev. block: {}", self.prev_hash())?;
         writeln!(f, "PoW: {}", ProofOfWork::new(self).validate())?;
         for tx in &self.transactions {
             writeln!(f, "{}", tx)?;

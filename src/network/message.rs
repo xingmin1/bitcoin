@@ -1,4 +1,4 @@
-use log::{debug, info};
+use log::{debug, error, info};
 
 use crate::{
     block::Block,
@@ -28,17 +28,7 @@ impl Message {
     pub fn new(from_id: usize, data: MessageData) -> Self {
         Self { from_id, data }
     }
-    // 处理消息{
-    //     版本消息 -》 对比链长度，如果小于，则发送获取区块消息，阻塞等待区块消息，然后递归处理
-    //     区块消息 -》 先验证区块，再验证区块中的交易，如果合法，则将该区块加入到区块缓存中，「
-    //         如果该区块的前一个区块是本线程区块链的tip，则将该区块缓存加入到区块链中，并更新tip
-    //         如果该区块的前一个区块不是本线程区块链的tip，则继续请求获取该区块的父区块，阻塞等待父区块消息，然后递归处理
-    //     」
-    //     交易消息 -》 验证交易，如果合法，则将该交易加入到交易缓存中
 
-    //     获取区块消息 -》 在区块链中找到该区块，并发送该区块
-    //     获取交易消息 -》 在交易缓存中找到该交易，并发送该交易
-    //     获取版本消息 -》 将本线程区块链的版本号发送
     pub fn handle(self, node: &mut Node, from_id: usize) {
         match self.data {
             MessageData::BlockChain {
@@ -74,6 +64,7 @@ impl Message {
             }
 
             MessageData::Transaction(transaction) => {
+                info!(target: "chain", "节点 {} 收到交易消息: {}", node.id, transaction);
                 // 铸币交易不应该被广播
                 if transaction.is_coinbase() {
                     panic!("铸币交易不会被广播");
@@ -92,13 +83,13 @@ impl Message {
                     .find_transaction(&transaction.id)
                     .is_some()
                     || !blockchain.unwrap().verify_transaction(&transaction)
-                    || node.transaction_cache.contains(&transaction)
+                    || node.mem_pool.as_ref().unwrap().transactions.contains(&transaction)
                 {
                     return;
                 }
 
                 // 将有效交易加入缓存
-                node.transaction_cache.push(transaction);
+                node.mem_pool.as_mut().unwrap().push(transaction);
             }
             MessageData::Address(address) => {
                 // 将地址加入到节点中

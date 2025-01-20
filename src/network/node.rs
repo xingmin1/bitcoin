@@ -1,8 +1,13 @@
-use log::{debug, info};
+use log::{debug, error, info};
 
 use crate::{
-    block::Block, blockchain::Blockchain, transaction::Transaction, utxo_set::UtxoSet,
+    block::{Block, Hash},
+    blockchain::Blockchain,
+    mem_pool::MemPool,
+    transaction::{Transaction, TxOutputs},
+    utxo_set::UtxoSet,
     wallet::Wallets,
+    CliMessage,
 };
 use std::{
     collections::HashMap,
@@ -15,9 +20,10 @@ pub struct Node {
     pub id: usize,
     pub utxo_set: Option<UtxoSet>,
     pub wallets: Wallets,
-    pub transaction_cache: Vec<Transaction>,
+    pub mem_pool: Option<MemPool>,
     pub send_channels: Vec<Sender<Message>>,
     pub recv_channel: Receiver<Message>,
+    pub cli_recv_channel: Receiver<CliMessage>,
     pub addresses: HashMap<usize, String>,
 }
 
@@ -26,6 +32,7 @@ impl Node {
         id: usize,
         send_channels: Vec<Sender<Message>>,
         recv_channel: Receiver<Message>,
+        cli_recv_channel: Receiver<CliMessage>,
     ) -> Self {
         let mut wallets = Wallets::new(&Node::path_prefix(id));
         if wallets.wallets.is_empty() {
@@ -37,9 +44,10 @@ impl Node {
             id,
             utxo_set: None,
             wallets,
-            transaction_cache: vec![],
+            mem_pool: Some(MemPool::new()),
             send_channels,
             recv_channel,
+            cli_recv_channel,
             addresses: HashMap::new(),
         }
     }
@@ -58,18 +66,37 @@ impl Node {
                 info!(target: "chain", "节点 {} 创建区块链，区块数量：{}", self.id, blocks.len());
                 let blockchain = Blockchain::create_with_blocks(blocks, &path);
                 self.utxo_set = Some(UtxoSet::new(blockchain));
+                self.utxo_set.as_mut().unwrap().reindex(&path);
+                self.mem_pool
+                    .as_mut()
+                    .unwrap()
+                    .update_utxo_set(self.utxo_set.as_mut().unwrap().get_utxo_set(&path));
             }
             Some(utxo_set) => {
                 // 如果 UTXO 集合存在，更新区块链
                 debug!(target: "chain", "节点 {} 更新区块链，区块数量：{}", self.id, blocks.len());
                 utxo_set.blockchain.update(blocks);
+                self.mem_pool
+                    .as_mut()
+                    .unwrap()
+                    .update_utxo_set(self.utxo_set.as_mut().unwrap().get_utxo_set(&path));
+                self.mem_pool.as_mut().unwrap().transactions.retain(|tx| {
+                    self.utxo_set
+                        .as_mut()
+                        .unwrap()
+                        .blockchain
+                        .find_transaction(&tx.id)
+                        .is_some()
+                });
             }
         }
         self.utxo_set.as_mut().unwrap().reindex(&path);
-        self.transaction_cache.retain(|tx| {
-            let blockchain = &self.utxo_set.as_mut().unwrap().blockchain;
-            blockchain.find_transaction(&tx.id).is_none() && blockchain.verify_transaction(tx)
-        });
+        self.mem_pool.as_mut().unwrap().clean_invalid_transaction(
+            self.utxo_set
+                .as_mut()
+                .unwrap()
+                .get_utxo_set(&Node::path_prefix(self.id)),
+        );
     }
 
     pub fn send_message_to_all(&self, message: Message) {
@@ -82,51 +109,84 @@ impl Node {
         format!("data/node_{}", node_id)
     }
 
-    /// 创建指定数量的节点
-    pub fn create_nodes(node_count: usize) -> Vec<Self> {
+    pub fn clean_data(node_count: usize) {
         // 清理创建data目录
         (0..node_count).for_each(|i| {
             let data_dir = Node::path_prefix(i);
             let _ = std::fs::remove_dir_all(&data_dir);
             std::fs::create_dir_all(&data_dir).unwrap();
         });
+    }
 
+    /// 创建指定数量的节点
+    pub fn create_nodes(node_count: usize) -> (Vec<Self>, Vec<Sender<CliMessage>>) {
         // 创建通信通道
         let (send_channels, recv_channels): (Vec<_>, Vec<_>) =
             (0..node_count).map(|_| channel::<Message>()).unzip();
+        let (cli_send_channels, cli_recv_channels): (Vec<_>, Vec<_>) =
+            (0..node_count).map(|_| channel::<CliMessage>()).unzip();
 
         // 创建节点
-        recv_channels
+        let nodes = recv_channels
             .into_iter()
+            .zip(cli_recv_channels)
             .enumerate()
-            .map(|(i, recv)| Self::new(i, send_channels.clone(), recv))
-            .collect()
+            .map(|(i, (recv, cli_recv))| Self::new(i, send_channels.clone(), recv, cli_recv))
+            .collect();
+        (nodes, cli_send_channels)
     }
 
     /// 转账
     pub fn send(&mut self, to_id: usize, amount: u32) {
         let address = self.addresses.get(&to_id).unwrap();
-        let tx = Transaction::new_utxo_transaction(
+        let (tx, given_utxo_set) = Transaction::new_utxo_transaction(
             self.wallets.get_addresses()[0].clone(),
             address.clone(),
             amount,
             self.utxo_set.as_ref().unwrap(),
             &Node::path_prefix(self.id),
+            Some(self.mem_pool.as_ref().unwrap().utxo_set.clone()),
         );
-        self.transaction_cache.push(tx.clone());
+        error!(
+            "send tx from: {}, to: {}, amount: {}, inputs: {:?}",
+            self.wallets.get_addresses()[0],
+            address,
+            amount,
+            tx.vin
+        );
+        debug!(target: "chain", "send tx verify: {}", self.utxo_set.as_ref().unwrap().blockchain.verify_transaction(&tx));
+        self.mem_pool.as_mut().unwrap().push(tx.clone());
+        self.mem_pool.as_mut().unwrap().utxo_set = given_utxo_set.unwrap();
+        debug!(target: "chain", "Transaction Cache: {}", self.mem_pool.as_ref().unwrap().len());
         self.send_message_to_all(Message::new(self.id, MessageData::Transaction(tx)));
     }
 
     /// 挖矿
     pub fn mine(&mut self) {
-        let _block = self
+        let coinbase_tx = Transaction::new_coinbase_tx(
+            self.wallets.get_addresses()[0].clone(),
+            // format!("Reward to '{}'", self.id),
+            "".to_string(),
+        );
+        let mut transactions = vec![coinbase_tx];
+        transactions.extend(self.mem_pool.as_ref().unwrap().transactions.iter().cloned());
+        let block = self
             .utxo_set
             .as_mut()
             .unwrap()
             .blockchain
-            .mine_block(self.transaction_cache.clone())
+            .mine_block(transactions)
             .unwrap();
-        self.transaction_cache.clear();
+        self.mem_pool.as_mut().unwrap().clear();
+        self.utxo_set
+            .as_mut()
+            .unwrap()
+            .reindex(&Node::path_prefix(self.id));
+        self.mem_pool.as_mut().unwrap().utxo_set = self
+            .utxo_set
+            .as_mut()
+            .unwrap()
+            .get_utxo_set(&Node::path_prefix(self.id));
         let length = self.utxo_set.as_mut().unwrap().blockchain.length;
         let block_chain: Vec<Block> = self.utxo_set.as_mut().unwrap().blockchain.iter().collect();
         info!(
@@ -154,9 +214,34 @@ impl Node {
 
     /// 整理交易缓存，使交易缓存中的交易符合区块链中的交易
     pub fn clean_invalid_transaction(&mut self) {
-        self.transaction_cache.retain(|tx| {
-            let blockchain = &self.utxo_set.as_mut().unwrap().blockchain;
-            blockchain.find_transaction(&tx.id).is_none() && blockchain.verify_transaction(tx)
+        let before_len = self.mem_pool.as_ref().unwrap().len();
+        self.mem_pool.as_mut().unwrap().transactions.retain(|tx| {
+            let exists = self
+                .utxo_set
+                .as_mut()
+                .unwrap()
+                .blockchain
+                .find_transaction(&tx.id)
+                .is_some();
+            if exists {
+                info!(target: "chain", "节点 {} 清理已存在的交易 {}", self.id, tx.id);
+            }
+            !exists
         });
+        self.mem_pool.as_mut().unwrap().clean_invalid_transaction(
+            self.utxo_set
+                .as_mut()
+                .unwrap()
+                .get_utxo_set(&Node::path_prefix(self.id)),
+        );
+        if before_len != self.mem_pool.as_ref().unwrap().len() {
+            info!(
+                target: "chain",
+                "节点 {} 清理交易缓存，从 {} 个减少到 {} 个",
+                self.id,
+                before_len,
+                self.mem_pool.as_ref().unwrap().len()
+            );
+        }
     }
 }

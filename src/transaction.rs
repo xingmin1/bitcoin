@@ -1,11 +1,13 @@
 use generic_array::{typenum, GenericArray};
-use log::trace;
+use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fmt::Display};
 
 use crate::{
-    block::Hash, utxo_set::UtxoSet, wallet::{self, Wallets}
+    block::Hash,
+    utxo_set::UtxoSet,
+    wallet::{self, Wallets},
 };
 
 const COINBASE_AMOUNT: u32 = 100;
@@ -23,6 +25,17 @@ pub struct TxOutputs {
     pub out_idxs: Vec<i32>,
 }
 
+impl TxOutputs {
+    pub fn remove_outputs(&mut self, out_idxs: &[i32]) {
+        for out_idx in out_idxs {
+            if let Some(idx) = self.out_idxs.iter().position(|idx| idx == out_idx) {
+                self.outputs.remove(idx);
+                self.out_idxs.remove(idx);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TxInput {
     pub txid: Option<Hash>,
@@ -31,9 +44,10 @@ pub struct TxInput {
     pub pub_key: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Transaction {
     pub id: Hash,
+    pub timestamp: i64, // 交易创建时间戳
     pub vin: Vec<TxInput>,
     pub vout: Vec<TxOutput>,
 }
@@ -44,6 +58,21 @@ impl Transaction {
         tx_copy.id = Hash::default();
         let encoded = bincode::serialize(&tx_copy).unwrap();
         Hash::from(&Sha256::digest(&encoded))
+    }
+
+    pub fn new(vin: Vec<TxInput>, vout: Vec<TxOutput>) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut tx = Transaction {
+            id: Hash::default(),
+            timestamp,
+            vin,
+            vout,
+        };
+        tx.id = tx.hash();
+        tx
     }
 
     pub fn new_coinbase_tx(to_address: String, mut data: String) -> Self {
@@ -65,8 +94,15 @@ impl Transaction {
             value: COINBASE_AMOUNT,
             pub_key_hash: to_pub_key_hash.to_vec(),
         };
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
         let mut tx = Self {
             id: Hash::default(),
+            timestamp,
             vin: vec![txin],
             vout: vec![txout],
         };
@@ -129,9 +165,7 @@ impl Transaction {
                 .pub_key_hash
                 .clone();
             tx_copy.id = tx_copy.hash();
-            tx_copy.vin[i].pub_key = prev_tx.vout[input.vout.unwrap() as usize]
-                .pub_key_hash
-                .clone();
+            tx_copy.vin[i].pub_key = vec![];
 
             let msg = secp256k1::Message::from_digest(
                 tx_copy
@@ -142,7 +176,9 @@ impl Transaction {
             );
             let sig = secp256k1::ecdsa::Signature::from_compact(&input.signature).unwrap();
             let pub_key = secp256k1::PublicKey::from_slice(&input.pub_key).unwrap();
+
             if secp.verify_ecdsa(&msg, &sig, &pub_key).is_err() {
+                debug!(target: "chain", "verify_transaction: 交易 {} 验证失败：签名验证失败", tx_copy.id);
                 return false;
             }
         }
@@ -173,6 +209,7 @@ impl Transaction {
 
         Self {
             id: self.id,
+            timestamp: self.timestamp,
             vin: inputs,
             vout: outputs,
         }
@@ -182,30 +219,50 @@ impl Transaction {
         self.vin.len() == 1 && self.vin[0].txid.is_none() && self.vin[0].vout.is_none()
     }
 
-    pub fn new_utxo_transaction(from: String, to: String, amount: u32, utxo_set: &UtxoSet, path_prefix: &str) -> Self {
+    pub fn new_utxo_transaction(
+        from: String,
+        to: String,
+        amount: u32,
+        utxo_set: &UtxoSet,
+        path_prefix: &str,
+        mut given_utxo_set: Option<HashMap<Hash, TxOutputs>>,
+    ) -> (Self, Option<HashMap<Hash, TxOutputs>>) {
         let mut inputs = vec![];
         let mut outputs = vec![];
 
         let wallets = Wallets::new(path_prefix);
         let wallet = wallets.get_wallet(&from).unwrap();
         let pub_key_hash = wallet::hash_pub_key(&wallet.public_key);
+        assert_eq!(pub_key_hash, bs58::decode(from).into_vec().unwrap()[1..21]);
         trace!("new_utxo_transaction pub_key_hash: {:?}", pub_key_hash);
 
-        let (acc, valid_outputs) = utxo_set.find_spendable_outputs(&pub_key_hash, amount, path_prefix);
+        let (acc, valid_outputs) = utxo_set.find_spendable_outputs(
+            &pub_key_hash,
+            amount,
+            path_prefix,
+            given_utxo_set.clone(),
+        );
         if acc < amount {
             panic!("ERROR: Not enough funds");
         }
 
         for (txid, outs) in valid_outputs {
-            for out in outs {
+            for out in outs.iter() {
                 let input = TxInput {
                     txid: Some(txid),
-                    vout: Some(out),
+                    vout: Some(*out),
                     signature: Default::default(),
                     pub_key: wallet.public_key.clone(),
                 };
                 inputs.push(input);
             }
+            given_utxo_set = given_utxo_set.map(|mut utxo_set| {
+                utxo_set.get_mut(&txid).unwrap().remove_outputs(&outs);
+                if utxo_set.get(&txid).unwrap().outputs.is_empty() {
+                    utxo_set.remove(&txid);
+                }
+                utxo_set
+            });
         }
 
         let decoded = bs58::decode(to).into_vec().unwrap();
@@ -222,14 +279,22 @@ impl Transaction {
             });
         }
 
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
         let mut tx = Self {
             id: Hash::default(),
+            timestamp,
             vin: inputs,
             vout: outputs,
         };
         tx.id = tx.hash();
-        utxo_set.blockchain.sign_transaction(&mut tx, wallet.private_key);
-        tx
+        utxo_set
+            .blockchain
+            .sign_transaction(&mut tx, wallet.private_key);
+        (tx, given_utxo_set)
     }
 }
 
@@ -258,8 +323,14 @@ impl Display for Transaction {
 
         for (i, input) in self.vin.iter().enumerate() {
             lines.push(format!("Input[{}]", i));
-            lines.push(format!("  ├─ TXID: {}", input.txid.as_ref().map_or("None".into(), |h| h.to_string())));
-            lines.push(format!("  ├─ Out: {}", input.vout.map_or("None".into(), |v| v.to_string())));
+            lines.push(format!(
+                "  ├─ TXID: {}",
+                input.txid.as_ref().map_or("None".into(), |h| h.to_string())
+            ));
+            lines.push(format!(
+                "  ├─ Out: {}",
+                input.vout.map_or("None".into(), |v| v.to_string())
+            ));
             lines.push(format!("  ├─ Signature: {:x?}", input.signature));
             lines.push(format!("  └─ PubKey: {:x?}", input.pub_key));
         }

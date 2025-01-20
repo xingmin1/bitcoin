@@ -1,4 +1,4 @@
-use log::info;
+use log::{info, trace};
 use num_bigint::BigUint;
 use sha2::{Digest, Sha256};
 
@@ -24,7 +24,7 @@ impl<'a> ProofOfWork<'a> {
         let mut hash_int;
 
         info!("开始挖矿...");
-        info!("交易数据: {}", self.block.transactions().iter().map(|tx| tx.to_string()).collect::<Vec<String>>().join("\n"));
+        trace!("交易数据: {}", self.block.transactions().iter().map(|tx| tx.to_string()).collect::<Vec<String>>().join("\n"));
         loop {
             hasher.update(self.prepare_data(&nonce));
             hash = hasher.finalize_reset();

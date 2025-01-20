@@ -1,9 +1,10 @@
 use anyhow::Result;
 use blockchain::Blockchain;
-use log::{debug, info};
+use log::{debug, error, info};
 use network::{Message, MessageData, Node};
 use secp256k1::rand::{self, Rng};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use utxo_set::UtxoSet;
@@ -12,6 +13,7 @@ mod block;
 mod blockchain;
 mod cli;
 mod logger;
+mod mem_pool;
 mod merkle_tree;
 mod network;
 mod proof_of_work;
@@ -20,13 +22,13 @@ mod utxo_set;
 mod wallet;
 
 // 系统配置常量
-const NODE_COUNT: usize = 4; // 节点数量
-const MINING_ROUNDS: usize = 10; // 每个节点的挖矿轮数
+const NODE_COUNT: usize = 6; // 节点数量
+const MINING_ROUNDS: usize = 9; // 每个节点的挖矿轮数
 const MIN_TRANSACTIONS_TO_MINE: usize = 2; // 开始挖矿所需的最小交易数
 const INITIAL_WAIT_TIME: u64 = 100; // 节点启动时的最大等待时间(ms)
 const MESSAGE_WAIT_TIME: u64 = 10; // 等待消息的最大时间(ms)
 const TRANSACTION_WAIT_TIMEOUT: u64 = 10; // 等待交易的超时时间(ms)
-const MESSAGE_HANDLE_TIMEOUT: u64 = 1000; // 消息处理的超时时间(ms)
+const MESSAGE_HANDLE_TIMEOUT: u64 = 100; // 消息处理的超时时间(ms)
 const MIN_TRANSACTION_AMOUNT: u32 = 1; // 最小转账金额
 const MAX_TRANSACTION_AMOUNT: u32 = 3; // 最大转账金额
 
@@ -35,32 +37,42 @@ static FINISHED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn main() -> Result<()> {
     logger::init();
+
+    let cli = cli::parse_cli();
+    cli::run_cli(cli)?;
+    Ok(())
+}
+
+pub fn auto_run(is_interactive: bool) -> Result<()> {
     info!(target: "chain", "比特币节点模拟程序启动");
-
-    let nodes = Node::create_nodes(NODE_COUNT);
-    info!(target: "chain", "创建了 {} 个节点", nodes.len());
-
-    let final_nodes = run_node_tasks(nodes)?;
+    let (nodes, cli_send_channels) = Node::create_nodes(NODE_COUNT);
+    let final_nodes = run_node_tasks(nodes, is_interactive, cli_send_channels)?;
     print_final_state(&final_nodes);
-
     Ok(())
 }
 
 /// 运行所有节点的任务
-fn run_node_tasks(nodes: Vec<Node>) -> Result<Vec<Node>> {
+fn run_node_tasks(
+    nodes: Vec<Node>,
+    is_interactive: bool,
+    cli_send_channels: Vec<Sender<CliMessage>>,
+) -> Result<Vec<Node>> {
     let final_nodes = Arc::new(Mutex::new(Vec::new()));
     let tasks: Vec<_> = nodes
         .into_iter()
         .map(|node| {
             let final_nodes = Arc::clone(&final_nodes);
             std::thread::spawn(move || -> Result<()> {
-                let final_node = run_single_node(node)?;
+                let final_node = run_single_node(node, is_interactive)?;
                 final_nodes.lock().unwrap().push(final_node);
                 Ok(())
             })
         })
         .collect();
 
+    if is_interactive {
+        cli::run_interactive_cli(cli_send_channels)?;
+    }
     for task in tasks {
         task.join().unwrap()?;
     }
@@ -84,19 +96,26 @@ fn print_final_state(nodes: &[Node]) {
             info!(target: "chain", "  最新区块哈希: {}", blockchain.tip);
             info!(target: "chain", "  区块链为 \n{}", blockchain.to_hashes_string());
             info!(target: "chain", "  账户地址: {}", node.wallets.get_addresses()[0]);
+            // info!(target: "chain", "  账户余额: {}", utxo_set.get_balance(node.wallets.get_addresses()[0], &Node::path_prefix(node.id), Some(node.mem_pool.as_ref().unwrap().utxo_set.clone())));
+            info!(target: "chain", "  账户余额: {}", utxo_set.get_balance(node.wallets.get_addresses()[0], &Node::path_prefix(node.id), Some(node.utxo_set.as_ref().unwrap().blockchain.find_utxo())));
         }
     }
     info!(target: "chain", "所有节点任务完成");
 }
 
 /// 运行单个节点的任务
-fn run_single_node(mut node: Node) -> Result<Node> {
+fn run_single_node(mut node: Node, is_interactive: bool) -> Result<Node> {
     info!(target: "chain", "节点 {} 开始运行", node.id);
     node.send_address_to_all();
     random_sleep(INITIAL_WAIT_TIME);
 
-    for round in 0..MINING_ROUNDS {
-        process_mining_round(&mut node, round)?;
+    let mining_rounds = if is_interactive {
+        usize::MAX
+    } else {
+        MINING_ROUNDS
+    };
+    for round in 0..mining_rounds {
+        process_mining_round(&mut node, round, is_interactive)?;
     }
 
     FINISHED_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -107,14 +126,15 @@ fn run_single_node(mut node: Node) -> Result<Node> {
 }
 
 /// 处理单轮挖矿任务
-fn process_mining_round(node: &mut Node, round: usize) -> Result<()> {
+fn process_mining_round(node: &mut Node, round: usize, is_interactive: bool) -> Result<()> {
     debug!(target: "mining", "节点 {} 开始第 {} 轮任务", node.id, round + 1);
     wait_for_message(node);
 
     initialize_blockchain_if_needed(node);
     wait_for_addresses_if_needed(node);
-    process_transactions(node, round);
-
+    generate_transactions(node, round, is_interactive);
+    debug!(target: "chain", "节点 {} transaction cache: {}", node.id, node.mem_pool.as_ref().unwrap().len());
+    info!(target: "chain", "节点 {} 开始收集交易", node.id);
     if try_collect_transactions(node) {
         mine_block(node);
     }
@@ -132,6 +152,7 @@ fn initialize_blockchain_if_needed(node: &mut Node) {
         );
         let utxo_set = UtxoSet::new(blockchain);
         utxo_set.reindex(&Node::path_prefix(node.id));
+        node.mem_pool.as_mut().unwrap().utxo_set = utxo_set.get_utxo_set(&Node::path_prefix(node.id));
         node.utxo_set = Some(utxo_set);
 
         if let Some(genesis) = genesis {
@@ -154,8 +175,57 @@ fn wait_for_addresses_if_needed(node: &mut Node) {
     }
 }
 
-/// 处理交易
-fn process_transactions(node: &mut Node, round: usize) {
+/// 生成随机交易
+fn generate_transactions(node: &mut Node, round: usize, is_interactive: bool) {
+    if is_interactive {
+        while let Ok(message) = node.cli_recv_channel.recv() {
+            match message {
+                CliMessage::Send { to_node_id, amount } => {
+                    info!(target: "chain", "节点 {} 向节点 {} 转账 {} 个币", node.id, to_node_id, amount);
+                    node.send(to_node_id, amount);
+                }
+                CliMessage::Continue => {
+                    return;
+                }
+                CliMessage::PrintBalance => {
+                    println!(
+                        "节点 {} 的余额: {}",
+                        node.id,
+                        node.utxo_set.as_ref().unwrap().get_balance(
+                            node.wallets.get_addresses()[0],
+                            &Node::path_prefix(node.id),
+                            // Some(node.mem_pool.as_ref().unwrap().utxo_set.clone())
+                            Some(node.utxo_set.as_ref().unwrap().blockchain.find_utxo())
+                        )
+                    );
+                }
+                CliMessage::PrintChain => {
+                    println!(
+                        "节点 {} 的区块链: {}",
+                        node.id,
+                        node.utxo_set
+                            .as_ref()
+                            .unwrap()
+                            .blockchain
+                            .to_hashes_string()
+                    );
+                }
+                CliMessage::VerifyChain => {
+                    println!(
+                        "节点 {} 的区块链验证: {:?}",
+                        node.id,
+                        node.utxo_set.as_ref().unwrap().blockchain.verify_chain()
+                    );
+                }
+                CliMessage::ListWallets => {
+                    let addresses = node.wallets.get_addresses();
+                    let addresses_str: Vec<String> =
+                        addresses.iter().map(|s| s.to_string()).collect();
+                    println!("节点 {} 的钱包地址: {}", node.id, addresses_str.join(", "));
+                }
+            }
+        }
+    }
     for _ in 0..(MINING_ROUNDS - round) {
         if let Some(amount) = generate_random_transaction_amount() {
             if let Some(to_id) = select_random_recipient(node) {
@@ -186,7 +256,7 @@ fn select_random_recipient(node: &Node) -> Option<usize> {
 fn check_balance(node: &Node, amount: u32) -> bool {
     if let Some(utxo_set) = &node.utxo_set {
         let balance =
-            utxo_set.get_balance(node.wallets.get_addresses()[0], &Node::path_prefix(node.id));
+            utxo_set.get_balance(node.wallets.get_addresses()[0], &Node::path_prefix(node.id), Some(node.mem_pool.as_ref().unwrap().utxo_set.clone()));
         balance >= amount
     } else {
         false
@@ -199,18 +269,19 @@ fn try_collect_transactions(node: &mut Node) -> bool {
     let timeout = Duration::from_millis(TRANSACTION_WAIT_TIMEOUT);
 
     node.clean_invalid_transaction();
-    while node.transaction_cache.len() < MIN_TRANSACTIONS_TO_MINE && start_time.elapsed() < timeout
-    {
+    debug!(target: "chain", "节点 {} 清理无效交易后，缓存交易数: {}", node.id, node.mem_pool.as_ref().unwrap().len());
+    while node.mem_pool.as_ref().unwrap().len() < MIN_TRANSACTIONS_TO_MINE && start_time.elapsed() < timeout {
         debug!(
             "节点 {} 等待交易，当前缓存交易数: {}",
             node.id,
-            node.transaction_cache.len()
+            node.mem_pool.as_ref().unwrap().len()
         );
         wait_for_message(node);
+        debug!(target: "chain", "节点 {} 清理无效交易前，缓存交易数: {}", node.id, node.mem_pool.as_ref().unwrap().len());
         node.clean_invalid_transaction();
     }
 
-    !node.transaction_cache.is_empty()
+    !node.mem_pool.as_ref().unwrap().transactions.is_empty()
 }
 
 /// 挖掘新区块
@@ -255,4 +326,13 @@ fn wait_for_other_nodes(node: &mut Node) {
             message.handle(node, from_id);
         }
     }
+}
+
+pub enum CliMessage {
+    Send { to_node_id: usize, amount: u32 },
+    PrintBalance,
+    PrintChain,
+    VerifyChain,
+    ListWallets,
+    Continue,
 }

@@ -5,7 +5,7 @@ use crate::{
     proof_of_work::ProofOfWork,
     transaction::{Transaction, TxOutputs},
 };
-use log::{debug, trace, warn};
+use log::{debug, error, trace, warn};
 use rocksdb::DB;
 use thiserror::Error;
 
@@ -51,26 +51,43 @@ impl Blockchain {
         let db = DB::open_default(format!("{}/{}", path_prefix, DB_PATH)).unwrap();
 
         if let Ok(Some(tip)) = db.get(DbKey::Tip) {
-            let length = db.get(DbKey::Length).unwrap().unwrap();
+            let length = match db.get(DbKey::Length) {
+                Ok(Some(length)) => match bincode::deserialize(&length) {
+                    Ok(len) => len,
+                    Err(e) => {
+                        error!(target: "chain", "反序列化区块链长度失败: {}", e);
+                        1
+                    }
+                },
+                _ => {
+                    error!(target: "chain", "读取区块链长度失败");
+                    1
+                }
+            };
+
             (
                 Self {
                     db,
                     tip: Hash::from(tip.as_slice()),
-                    length: bincode::deserialize(&length).unwrap(),
+                    length,
                 },
                 None,
             )
         } else {
-            debug!("create genesis block");
+            error!("create genesis block");
 
             let genesis_tx = Transaction::new_coinbase_tx(genesis_address, "".to_string());
             let genesis = Block::genesis(genesis_tx).unwrap();
             let tip = genesis.hash();
-            db.put(DbKey::Block(tip), bincode::serialize(&genesis).unwrap())
-                .unwrap();
-            db.put(DbKey::Tip, tip.as_bytes()).unwrap();
-            db.put(DbKey::Length, bincode::serialize(&1).unwrap())
-                .unwrap();
+
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.put(DbKey::Block(tip), bincode::serialize(&genesis).unwrap());
+            batch.put(DbKey::Tip, tip.as_bytes());
+            batch.put(DbKey::Length, bincode::serialize(&1_u64).unwrap());
+
+            db.write(batch).unwrap();
+            db.flush().unwrap();
+
             (
                 Self {
                     db,
@@ -117,9 +134,9 @@ impl Blockchain {
             return;
         }
 
-        if blocks.last().unwrap().prev_hash != self.tip {
+        if *blocks.last().unwrap().prev_hash() != self.tip {
             assert_eq!(
-                blocks.last().unwrap().prev_hash,
+                *blocks.last().unwrap().prev_hash(),
                 Hash::default(),
                 "区块链的创世纪区块的prev_hash必须为0"
             );
@@ -157,6 +174,7 @@ impl Blockchain {
     }
 
     pub fn mine_block(&mut self, transactions: Vec<Transaction>) -> Result<Block, BlockchainError> {
+        // error!("transactions: {:?}", transactions);
         for tx in &transactions {
             if !self.verify_transaction(tx) {
                 warn!("mine_block: 交易验证失败，交易id: {:?}", tx.id);
@@ -269,8 +287,12 @@ impl Blockchain {
                     .push(vin.vout.unwrap());
             });
         trace!("spent_txos: {:?}", spent_txos);
+        // error!("transactions: {:?}", transactions);
         // 遍历所有交易，找到未花费的输出
         transactions.for_each(|tx| {
+            // if tx.is_coinbase() {
+            //     error!("coinbase: {:?}", tx.id);
+            // }
             tx.vout
                 .iter()
                 .enumerate()
@@ -280,6 +302,9 @@ impl Blockchain {
                 // 过滤掉已经花费的输出
                 .filter(|(out_id, _)| {
                     spent_txos.get(&tx.id).map_or(true, |spent_outputs| {
+                        // if tx.is_coinbase() {
+                        //     error!("coinbase: {:?} is spent", tx.id);
+                        // }
                         !spent_outputs.contains(&(*out_id as i32))
                     })
                 })
@@ -296,6 +321,7 @@ impl Blockchain {
                         .push(out_id as i32);
                 });
         });
+        // error!("utxo: {:?}", utxo);
 
         utxo
     }
@@ -337,6 +363,7 @@ impl Blockchain {
 
         // 如果有任何一个输入交易找不到，则返回false
         if prev_txs.iter().any(|tx| tx.is_none()) {
+            debug!(target: "chain", "verify_transaction: 交易 {} 验证失败：找不到输入引用的交易", tx.id);
             return false;
         }
 
@@ -395,5 +422,11 @@ impl<'a> IntoIterator for &'a Blockchain {
             db: &self.db,
             current_hash: self.tip,
         }
+    }
+}
+
+impl Drop for Blockchain {
+    fn drop(&mut self) {
+        self.db.flush().unwrap();
     }
 }
